@@ -123,6 +123,7 @@ class KeysBody(BaseModel):
     groq: Optional[str] = None
     cerebras: Optional[str] = None
     pexels: Optional[str] = None
+    pixabay: Optional[str] = None
 
 
 class RenderOptions(BaseModel):
@@ -169,6 +170,7 @@ async def keys_status():
         "groq": bool(keys.get("groq")),
         "cerebras": bool(keys.get("cerebras")),
         "pexels": bool(keys.get("pexels")),
+        "pixabay": bool(keys.get("pixabay")),
     }
 
 
@@ -184,12 +186,13 @@ async def set_keys(body: KeysBody):
 @api.post("/keys/test")
 async def test_keys():
     k = await get_keys()
-    g, c, p = await asyncio.gather(
+    g, c, p, pb = await asyncio.gather(
         ai.test_groq(k.get("groq", "")),
         ai.test_cerebras(k.get("cerebras", "")),
         ai.test_pexels(k.get("pexels", "")),
+        ai.test_pixabay(k.get("pixabay", "")),
     )
-    return {"groq": g, "cerebras": c, "pexels": p}
+    return {"groq": g, "cerebras": c, "pexels": p, "pixabay": pb}
 
 
 # ---------- ROUTES: PROJECTS ----------
@@ -467,10 +470,22 @@ async def analyze(pid: str, bg: BackgroundTasks):
 
 # ---------- B-ROLL SEARCH ----------
 @api.get("/projects/{pid}/broll_search")
-async def broll_search(pid: str, query: str, per_page: int = 4):
+async def broll_search(pid: str, query: str, per_page: int = 6, orientation: str = "landscape"):
+    """Merges Pexels + Pixabay results (Pixabay first - higher quality)."""
     keys = await get_keys()
-    results = await ai.search_pexels_video(query, keys.get("pexels", ""), per_page=per_page)
-    return {"query": query, "results": results}
+    px_orient = "landscape" if orientation != "vertical" else "portrait"
+    pb_orient = "vertical" if orientation == "vertical" else "horizontal"
+    pexels_task = ai.search_pexels_video(query, keys.get("pexels", ""), per_page=per_page, orientation=px_orient)
+    pixabay_task = ai.search_pixabay_video(query, keys.get("pixabay", ""), per_page=per_page, orientation=pb_orient)
+    pex, pix = await asyncio.gather(pexels_task, pixabay_task, return_exceptions=True)
+    pex = pex if isinstance(pex, list) else []
+    pix = pix if isinstance(pix, list) else []
+    # Interleave (Pixabay first — better curation) then Pexels
+    merged = []
+    for i in range(max(len(pix), len(pex))):
+        if i < len(pix): merged.append(pix[i])
+        if i < len(pex): merged.append(pex[i])
+    return {"query": query, "results": merged, "counts": {"pixabay": len(pix), "pexels": len(pex)}}
 
 
 @api.post("/projects/{pid}/broll_upload")
@@ -685,16 +700,24 @@ async def render(pid: str, opts: RenderOptions, bg: BackgroundTasks):
 
 
 # ---------- MEDIA ----------
+def _clean_filename(name: str) -> str:
+    """Strip original extension and unsafe chars so downloads are always .mp4"""
+    stem = os.path.splitext(name or "video")[0]
+    stem = re.sub(r"[^\w\s.-]+", "_", stem).strip() or "video"
+    return stem[:80]
+
+
 @api.get("/projects/{pid}/download")
 async def download_final(pid: str, clip: Optional[str] = None):
     """Download the main render, or a viral clip if ?clip=<label> is given."""
     proj = await get_project(pid)
+    base = _clean_filename(proj.get("name") or "video")
     if clip:
         out = (proj.get("viral_renders") or {}).get(clip)
-        fname = f"{proj.get('name','video')}_{clip}.mp4"
+        fname = f"{base}_{clip}.mp4"
     else:
         out = proj.get("output_path")
-        fname = f"{proj.get('name','video')}_edited.mp4"
+        fname = f"{base}_edited.mp4"
     if not out or not os.path.exists(out):
         raise HTTPException(404, "Output not ready")
     return FileResponse(out, media_type="video/mp4", filename=fname)

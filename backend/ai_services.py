@@ -175,13 +175,14 @@ Rules:
 
 
 # ---------- PEXELS ----------
-async def search_pexels_video(query: str, pexels_key: str, per_page: int = 4) -> List[Dict]:
-    """Search Pexels for stock video clips."""
+async def search_pexels_video(query: str, pexels_key: str, per_page: int = 6,
+                              orientation: str = "landscape") -> List[Dict]:
+    """Search Pexels for stock video clips. Prefers 1080p+ files."""
     if not pexels_key:
         return []
     headers = {"Authorization": pexels_key}
     url = "https://api.pexels.com/videos/search"
-    params = {"query": query, "per_page": per_page, "orientation": "landscape"}
+    params = {"query": query, "per_page": per_page, "orientation": orientation, "size": "medium"}
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url, headers=headers, params=params)
         if r.status_code != 200:
@@ -190,24 +191,82 @@ async def search_pexels_video(query: str, pexels_key: str, per_page: int = 4) ->
         data = r.json()
     results = []
     for v in data.get("videos", []):
-        files = sorted(v.get("video_files", []), key=lambda f: f.get("width", 0))
+        files = sorted(v.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True)
         picked = None
+        # Prefer 1080p-1440p mp4
         for f in files:
-            if f.get("width", 0) >= 640 and f.get("file_type") == "video/mp4":
+            w = f.get("width", 0)
+            if 1080 <= w <= 1920 and f.get("file_type") == "video/mp4":
                 picked = f
                 break
+        if not picked:
+            for f in files:
+                if f.get("width", 0) >= 720 and f.get("file_type") == "video/mp4":
+                    picked = f
+                    break
         if not picked and files:
             picked = files[len(files) // 2]
         if not picked:
             continue
         results.append({
-            "id": v.get("id"),
+            "id": f"px_{v.get('id')}",
+            "provider": "pexels",
             "duration": v.get("duration"),
             "thumbnail": v.get("image"),
             "video_url": picked.get("link"),
             "width": picked.get("width"),
             "height": picked.get("height"),
             "user": (v.get("user") or {}).get("name", ""),
+        })
+    return results
+
+
+# ---------- PIXABAY (higher-quality free alternative) ----------
+async def search_pixabay_video(query: str, pixabay_key: str, per_page: int = 6,
+                               orientation: str = "horizontal") -> List[Dict]:
+    """Search Pixabay for stock video clips. Free, no attribution required."""
+    if not pixabay_key:
+        return []
+    url = "https://pixabay.com/api/videos/"
+    # Pixabay video_type: film/animation; orientation: horizontal/vertical/all
+    orient = "vertical" if orientation in ("portrait", "vertical") else "horizontal"
+    params = {
+        "key": pixabay_key,
+        "q": query,
+        "per_page": max(3, min(per_page, 20)),
+        "video_type": "film",
+        "orientation": orient,
+        "safesearch": "true",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params=params)
+        if r.status_code != 200:
+            logger.warning(f"Pixabay error {r.status_code}: {r.text[:200]}")
+            return []
+        data = r.json()
+    results = []
+    for v in data.get("hits", []):
+        vids = v.get("videos", {})
+        # Prefer large/medium quality
+        picked = None
+        for key in ("large", "medium", "small"):
+            f = vids.get(key) or {}
+            if f.get("url") and f.get("width", 0) >= 640:
+                picked = f
+                picked["_tier"] = key
+                break
+        if not picked:
+            continue
+        results.append({
+            "id": f"pb_{v.get('id')}",
+            "provider": "pixabay",
+            "duration": v.get("duration"),
+            "thumbnail": (vids.get("large") or vids.get("medium") or {}).get("thumbnail")
+                         or f"https://i.vimeocdn.com/video/{v.get('picture_id')}_640x360.jpg",
+            "video_url": picked.get("url"),
+            "width": picked.get("width"),
+            "height": picked.get("height"),
+            "user": v.get("user", ""),
         })
     return results
 
@@ -332,6 +391,22 @@ async def test_pexels(api_key: str) -> Dict[str, Any]:
                 "https://api.pexels.com/videos/search",
                 headers={"Authorization": api_key},
                 params={"query": "city", "per_page": 1},
+            )
+        if r.status_code == 200:
+            return {"ok": True}
+        return {"ok": False, "error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
+async def test_pixabay(api_key: str) -> Dict[str, Any]:
+    if not api_key:
+        return {"ok": False, "error": "No key"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://pixabay.com/api/videos/",
+                params={"key": api_key, "q": "city", "per_page": 3},
             )
         if r.status_code == 200:
             return {"ok": True}

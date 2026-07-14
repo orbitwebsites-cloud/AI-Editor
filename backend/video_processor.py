@@ -257,7 +257,9 @@ def cut_and_concat(input_path: str, keep_segments: List[Dict], output_path: str,
         "-filter_complex", filter_complex,
         "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "main", "-level", "4.0",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -341,7 +343,9 @@ def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float
         cmd += ["-map", "0:v", "-map", "0:a"]
     cmd += [
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "160k",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "main", "-level", "4.0",
+        "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
         "-movflags", "+faststart",
         "-shortest",
         output_path,

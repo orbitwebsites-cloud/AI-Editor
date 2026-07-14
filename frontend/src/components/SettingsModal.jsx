@@ -23,16 +23,24 @@ const PROVIDERS = [
     {
         id: "pexels",
         name: "Pexels",
-        role: "B-roll Stock Video",
+        role: "B-roll Stock (fallback)",
         url: "https://www.pexels.com/api/",
         placeholder: "563492ad6f...",
+        required: false,
+    },
+    {
+        id: "pixabay",
+        name: "Pixabay",
+        role: "B-roll Stock (recommended)",
+        url: "https://pixabay.com/api/docs/",
+        placeholder: "12345678-abc...",
         required: false,
     },
 ];
 
 export default function SettingsModal({ open, onClose, onSaved }) {
-    const [values, setValues] = useState({ groq: "", cerebras: "", pexels: "" });
-    const [status, setStatus] = useState({ groq: false, cerebras: false, pexels: false });
+    const [values, setValues] = useState({ groq: "", cerebras: "", pexels: "", pixabay: "" });
+    const [status, setStatus] = useState({ groq: false, cerebras: false, pexels: false, pixabay: false });
     const [testResults, setTestResults] = useState(null);
     const [testing, setTesting] = useState(false);
     const [saving, setSaving] = useState(false);
@@ -40,7 +48,7 @@ export default function SettingsModal({ open, onClose, onSaved }) {
     useEffect(() => {
         if (open) {
             getKeysStatus().then(setStatus).catch(() => {});
-            setValues({ groq: "", cerebras: "", pexels: "" });
+            setValues({ groq: "", cerebras: "", pexels: "", pixabay: "" });
             setTestResults(null);
         }
     }, [open]);
@@ -64,7 +72,7 @@ export default function SettingsModal({ open, onClose, onSaved }) {
             setStatus(fresh);
             onSaved?.();
             toast.success("Keys locked in");
-            setValues({ groq: "", cerebras: "", pexels: "" });
+            setValues({ groq: "", cerebras: "", pexels: "", pixabay: "" });
         } catch (e) {
             toast.error("Save failed");
         } finally {
