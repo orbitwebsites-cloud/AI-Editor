@@ -1,88 +1,472 @@
-from fastapi import FastAPI, APIRouter
+"""AI Video Editor Backend
+Endpoints:
+  POST   /api/keys                     Save/update API keys (Fernet-encrypted)
+  GET    /api/keys/status              Which keys are configured
+  POST   /api/keys/test                Test all providers
+  POST   /api/projects/upload          Upload a video file
+  GET    /api/projects                 List projects
+  GET    /api/projects/{id}            Project details
+  DELETE /api/projects/{id}            Delete
+  POST   /api/projects/{id}/analyze    Transcribe + LLM analyze (background)
+  POST   /api/projects/{id}/broll_search  Fetch Pexels results per moment
+  POST   /api/projects/{id}/render     Render final video (background)
+  GET    /api/projects/{id}/download   Serve final MP4
+  GET    /api/media/original/{id}      Stream original video
+  GET    /api/media/output/{id}        Stream output video
+"""
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from cryptography.fernet import Fernet
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Optional, Dict, Any
+from pathlib import Path
 import os
 import logging
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
 import uuid
+import shutil
+import asyncio
+import aiofiles
 from datetime import datetime, timezone
 
+import ai_services as ai
+import video_processor as vp
 
+
+# ---------- BOOTSTRAP ----------
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
+mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db = client[os.environ["DB_NAME"]]
 
-# Create the main app without a prefix
-app = FastAPI()
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+SFX_DIR = os.environ.get("SFX_DIR", "/app/backend/assets/sfx")
+for sub in ("videos", "audio", "output", "subtitles", "broll"):
+    (DATA_DIR / sub).mkdir(parents=True, exist_ok=True)
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+cipher = Fernet(os.environ["MASTER_ENCRYPTION_KEY"].encode())
+
+USER_ID = "default_user"  # single-user MVP
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s | %(message)s")
+logger = logging.getLogger("backend")
+
+app = FastAPI(title="AI Video Editor")
+api = APIRouter(prefix="/api")
 
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+# ---------- KEY MANAGEMENT ----------
+def _enc(v: str) -> str:
+    return cipher.encrypt(v.encode()).decode()
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
 
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
+def _dec(v: str) -> str:
+    return cipher.decrypt(v.encode()).decode()
+
+
+async def get_keys() -> Dict[str, str]:
+    doc = await db.settings.find_one({"user_id": USER_ID})
+    if not doc:
+        return {}
+    encrypted = doc.get("keys", {})
+    out = {}
+    for k, v in encrypted.items():
+        try:
+            out[k] = _dec(v)
+        except Exception:
+            pass
+    return out
+
+
+async def save_keys(new_keys: Dict[str, str]) -> None:
+    existing = await db.settings.find_one({"user_id": USER_ID}) or {}
+    encrypted = existing.get("keys", {})
+    for k, v in new_keys.items():
+        if v and v.strip() and not v.startswith("***"):
+            encrypted[k] = _enc(v.strip())
+    await db.settings.update_one(
+        {"user_id": USER_ID},
+        {"$set": {"keys": encrypted, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+
+
+@app.on_event("startup")
+async def seed_keys_from_env():
+    """If DB has no keys yet, seed from env vars (SEED_*_KEY)."""
+    existing = await db.settings.find_one({"user_id": USER_ID})
+    if existing and existing.get("keys"):
+        logger.info("Keys already present in DB; skipping seed.")
+        return
+    seed = {}
+    if os.environ.get("SEED_GROQ_KEY"):
+        seed["groq"] = os.environ["SEED_GROQ_KEY"]
+    if os.environ.get("SEED_CEREBRAS_KEY"):
+        seed["cerebras"] = os.environ["SEED_CEREBRAS_KEY"]
+    if os.environ.get("SEED_PEXELS_KEY"):
+        seed["pexels"] = os.environ["SEED_PEXELS_KEY"]
+    if seed:
+        await save_keys(seed)
+        logger.info(f"Seeded keys from env: {list(seed.keys())}")
+
+
+# ---------- MODELS ----------
+class KeysBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    groq: Optional[str] = None
+    cerebras: Optional[str] = None
+    pexels: Optional[str] = None
+
+
+class RenderOptions(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    style: str = "tiktok"           # tiktok | youtube
+    remove_fillers: bool = True
+    captions: bool = True
+    sfx: bool = True
+    zoom_ins: bool = True
+    broll: bool = True
+    excluded_filler_indices: List[int] = Field(default_factory=list)  # user un-flagged fillers
+    added_filler_indices: List[int] = Field(default_factory=list)     # user added fillers
+    selected_broll: List[Dict[str, Any]] = Field(default_factory=list)  # [{moment_id, video_url}]
+
+
+# ---------- HELPERS ----------
+async def update_project(pid: str, **fields) -> None:
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.projects.update_one({"id": pid}, {"$set": fields})
+
+
+async def get_project(pid: str) -> Dict:
+    doc = await db.projects.find_one({"id": pid}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Project not found")
+    return doc
+
+
+# ---------- ROUTES: KEYS ----------
+@api.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"ok": True, "app": "AI Video Editor", "version": "0.1.0"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+@api.get("/keys/status")
+async def keys_status():
+    keys = await get_keys()
+    return {
+        "groq": bool(keys.get("groq")),
+        "cerebras": bool(keys.get("cerebras")),
+        "pexels": bool(keys.get("pexels")),
+    }
 
-# Include the router in the main app
-app.include_router(api_router)
 
+@api.post("/keys")
+async def set_keys(body: KeysBody):
+    payload = {k: v for k, v in body.model_dump().items() if v}
+    if not payload:
+        raise HTTPException(400, "No keys provided")
+    await save_keys(payload)
+    return {"ok": True, "updated": list(payload.keys())}
+
+
+@api.post("/keys/test")
+async def test_keys():
+    k = await get_keys()
+    g, c, p = await asyncio.gather(
+        ai.test_groq(k.get("groq", "")),
+        ai.test_cerebras(k.get("cerebras", "")),
+        ai.test_pexels(k.get("pexels", "")),
+    )
+    return {"groq": g, "cerebras": c, "pexels": p}
+
+
+# ---------- ROUTES: PROJECTS ----------
+@api.post("/projects/upload")
+async def upload_project(file: UploadFile = File(...)):
+    pid = str(uuid.uuid4())
+    ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
+    ext = ext.lower()
+    if ext not in {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}:
+        raise HTTPException(400, f"Unsupported video type: {ext}")
+    dst = DATA_DIR / "videos" / f"{pid}{ext}"
+
+    total = 0
+    async with aiofiles.open(dst, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            await out.write(chunk)
+            total += len(chunk)
+
+    # Probe
+    try:
+        meta = vp.probe_video(str(dst))
+    except Exception as e:
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, f"Invalid video file: {e}")
+
+    project = {
+        "id": pid,
+        "user_id": USER_ID,
+        "name": file.filename or f"Project-{pid[:8]}",
+        "status": "uploaded",
+        "status_message": "Uploaded, ready to analyze",
+        "progress": 0,
+        "original_path": str(dst),
+        "size_bytes": total,
+        "duration": meta.get("duration", 0),
+        "width": meta.get("width", 0),
+        "height": meta.get("height", 0),
+        "fps": meta.get("fps", 30),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "transcript": None,
+        "analysis": None,
+        "output_path": None,
+        "render_options": None,
+    }
+    await db.projects.insert_one(project)
+    project.pop("_id", None)
+    return project
+
+
+@api.get("/projects")
+async def list_projects():
+    items = await db.projects.find(
+        {"user_id": USER_ID},
+        {"_id": 0, "transcript.words": 0, "transcript.segments": 0},
+    ).sort("created_at", -1).to_list(100)
+    return items
+
+
+@api.get("/projects/{pid}")
+async def project_detail(pid: str):
+    return await get_project(pid)
+
+
+@api.delete("/projects/{pid}")
+async def delete_project(pid: str):
+    doc = await db.projects.find_one({"id": pid})
+    if not doc:
+        raise HTTPException(404)
+    # Clean files
+    for k in ("original_path", "audio_path", "output_path"):
+        p = doc.get(k)
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    await db.projects.delete_one({"id": pid})
+    return {"ok": True}
+
+
+# ---------- ANALYZE PIPELINE ----------
+async def _run_analysis(pid: str):
+    try:
+        keys = await get_keys()
+        if not keys.get("groq"):
+            await update_project(pid, status="error",
+                                 status_message="Groq API key not configured. Add it in Settings.")
+            return
+
+        proj = await get_project(pid)
+        await update_project(pid, status="extracting_audio", progress=5,
+                             status_message="Extracting audio...")
+
+        audio_path = str(DATA_DIR / "audio" / f"{pid}.mp3")
+        await asyncio.to_thread(vp.extract_audio, proj["original_path"], audio_path)
+        await update_project(pid, audio_path=audio_path, progress=15,
+                             status="transcribing",
+                             status_message="Transcribing with Whisper (Groq)...")
+
+        transcript = await ai.transcribe_audio(audio_path, keys["groq"])
+        await update_project(pid, transcript=transcript, progress=55,
+                             status="analyzing",
+                             status_message="AI analyzing for fillers, emphasis, B-roll...")
+
+        analysis = await ai.analyze_transcript(transcript.get("words", []), keys)
+        await update_project(pid, analysis=analysis, progress=100, status="ready",
+                             status_message="Ready to edit & render")
+    except Exception as e:
+        logger.exception("Analysis failed")
+        await update_project(pid, status="error", status_message=f"Analysis failed: {e}")
+
+
+@api.post("/projects/{pid}/analyze")
+async def analyze(pid: str, bg: BackgroundTasks):
+    proj = await get_project(pid)
+    if proj["status"] in ("transcribing", "analyzing", "extracting_audio", "rendering"):
+        return {"ok": True, "status": proj["status"], "already_running": True}
+    await update_project(pid, status="queued", status_message="Queued for analysis...", progress=1)
+    bg.add_task(_run_analysis, pid)
+    return {"ok": True, "status": "queued"}
+
+
+# ---------- B-ROLL SEARCH ----------
+@api.get("/projects/{pid}/broll_search")
+async def broll_search(pid: str, query: str, per_page: int = 4):
+    keys = await get_keys()
+    results = await ai.search_pexels_video(query, keys.get("pexels", ""), per_page=per_page)
+    return {"query": query, "results": results}
+
+
+# ---------- RENDER PIPELINE ----------
+async def _run_render(pid: str, opts: RenderOptions):
+    try:
+        proj = await get_project(pid)
+        await update_project(pid, status="rendering", progress=5,
+                             status_message="Preparing render...", render_options=opts.model_dump())
+
+        transcript = proj.get("transcript") or {}
+        words = transcript.get("words", [])
+        analysis = proj.get("analysis") or {}
+        duration = float(proj.get("duration", 0))
+        w = int(proj.get("width") or 1920) or 1920
+        h = int(proj.get("height") or 1080) or 1080
+
+        # Reconcile filler indices
+        auto_fillers = set(analysis.get("filler_indices", []))
+        auto_fillers -= set(opts.excluded_filler_indices)
+        auto_fillers |= set(opts.added_filler_indices)
+        filler_indices = list(auto_fillers) if opts.remove_fillers else []
+
+        # Compute keep segments
+        keep = vp.build_keep_segments(words, filler_indices, duration)
+        await update_project(pid, progress=15, status_message="Cutting filler segments...")
+
+        cut_path = str(DATA_DIR / "output" / f"{pid}_cut.mp4")
+        await asyncio.to_thread(vp.cut_and_concat, proj["original_path"], keep, cut_path, w, h)
+        await update_project(pid, progress=45, status_message="Generating animated captions...")
+
+        # Build ASS captions
+        ass_path = None
+        if opts.captions and words:
+            ass_path = str(DATA_DIR / "subtitles" / f"{pid}.ass")
+            emphasis_set = set(analysis.get("emphasis_indices", [])) if opts.zoom_ins else set()
+            await asyncio.to_thread(vp.generate_ass, words, ass_path, opts.style, w, h,
+                                    emphasis_set, keep)
+
+        # SFX events (whoosh at each cut boundary in output timeline)
+        sfx_events = []
+        if opts.sfx:
+            t = 0.0
+            for seg in keep[:-1]:
+                t += (seg["end"] - seg["start"])
+                sfx_events.append(t)
+
+        # B-roll events: user-selected
+        broll_events = []
+        if opts.broll and opts.selected_broll:
+            await update_project(pid, progress=55, status_message="Downloading B-roll clips...")
+            for i, sel in enumerate(opts.selected_broll):
+                url = sel.get("video_url")
+                moment_word_idx = int(sel.get("word_index", 0))
+                if not url:
+                    continue
+                local = str(DATA_DIR / "broll" / f"{pid}_broll_{i}.mp4")
+                ok = await vp.download_broll(url, local)
+                if not ok:
+                    continue
+                # Compute output time from word index remap
+                if moment_word_idx < len(words):
+                    orig_t = float(words[moment_word_idx].get("start", 0))
+                else:
+                    orig_t = 0
+                # Simple remap
+                offset = 0.0
+                out_t = None
+                for seg in keep:
+                    s, e = seg["start"], seg["end"]
+                    if orig_t < s:
+                        out_t = offset
+                        break
+                    if orig_t <= e:
+                        out_t = offset + (orig_t - s)
+                        break
+                    offset += (e - s)
+                if out_t is None:
+                    out_t = offset
+                broll_events.append({
+                    "local_path": local,
+                    "out_start": max(0, out_t),
+                    "out_duration": 3.5,
+                })
+
+        await update_project(pid, progress=70, status_message="Rendering final video...")
+        output_path = str(DATA_DIR / "output" / f"{pid}_final.mp4")
+        vp.render_final(cut_path, ass_path, sfx_events, broll_events, SFX_DIR, output_path)
+
+        # Cleanup intermediate
+        try:
+            os.remove(cut_path)
+        except Exception:
+            pass
+
+        await update_project(pid, status="done", progress=100,
+                             status_message="Render complete!",
+                             output_path=output_path)
+    except Exception as e:
+        logger.exception("Render failed")
+        await update_project(pid, status="error", status_message=f"Render failed: {e}")
+
+
+@api.post("/projects/{pid}/render")
+async def render(pid: str, opts: RenderOptions, bg: BackgroundTasks):
+    proj = await get_project(pid)
+    if not proj.get("transcript"):
+        raise HTTPException(400, "Project not analyzed yet")
+    await update_project(pid, status="queued_render",
+                         status_message="Render queued...", progress=1)
+    bg.add_task(_run_render, pid, opts)
+    return {"ok": True, "status": "queued_render"}
+
+
+# ---------- MEDIA ----------
+@api.get("/projects/{pid}/download")
+async def download_final(pid: str):
+    proj = await get_project(pid)
+    out = proj.get("output_path")
+    if not out or not os.path.exists(out):
+        raise HTTPException(404, "Output not ready")
+    return FileResponse(out, media_type="video/mp4",
+                        filename=f"{proj.get('name','video')}_edited.mp4")
+
+
+@api.get("/media/original/{pid}")
+async def media_original(pid: str):
+    proj = await get_project(pid)
+    p = proj.get("original_path")
+    if not p or not os.path.exists(p):
+        raise HTTPException(404)
+    return FileResponse(p, media_type="video/mp4")
+
+
+@api.get("/media/output/{pid}")
+async def media_output(pid: str):
+    proj = await get_project(pid)
+    p = proj.get("output_path")
+    if not p or not os.path.exists(p):
+        raise HTTPException(404)
+    return FileResponse(p, media_type="video/mp4")
+
+
+# ---------- APP WIRING ----------
+app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

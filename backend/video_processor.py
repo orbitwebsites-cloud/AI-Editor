@@ -1,0 +1,324 @@
+"""FFmpeg-based video processing pipeline.
+- Extract audio
+- Cut filler segments
+- Burn animated ASS captions (TikTok or YouTube style)
+- Overlay B-roll clips
+- Add SFX on cuts
+"""
+import os
+import subprocess
+import json
+import logging
+import shlex
+from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def run_ff(cmd: list, log: bool = True) -> None:
+    if log:
+        logger.info("FFMPEG: " + " ".join(shlex.quote(c) for c in cmd[:20]) + (" ..." if len(cmd) > 20 else ""))
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        logger.error(f"FFmpeg failed: {proc.stderr[-1500:]}")
+        raise RuntimeError(f"FFmpeg failed: {proc.stderr[-500:]}")
+
+
+def probe_video(path: str) -> Dict[str, Any]:
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(proc.stdout)
+    v_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+    return {
+        "duration": float(data.get("format", {}).get("duration", 0)),
+        "width": int(v_stream.get("width", 0)),
+        "height": int(v_stream.get("height", 0)),
+        "fps": _parse_fps(v_stream.get("r_frame_rate", "30/1")),
+        "size": int(data.get("format", {}).get("size", 0)),
+    }
+
+
+def _parse_fps(rate: str) -> float:
+    try:
+        num, den = rate.split("/")
+        return float(num) / float(den)
+    except Exception:
+        return 30.0
+
+
+def extract_audio(input_path: str, output_path: str) -> None:
+    """Extract compressed mp3 audio suitable for Whisper (under 25MB)."""
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-b:a", "48k",
+        output_path,
+    ]
+    run_ff(cmd)
+
+
+# ---------- FILLER SEGMENT MERGING ----------
+def build_keep_segments(words: List[Dict], filler_indices: List[int],
+                        duration: float, pad: float = 0.03) -> List[Dict]:
+    if not words:
+        return [{"start": 0, "end": duration}]
+    fillers = set(filler_indices or [])
+    remove = []
+    for i, w in enumerate(words):
+        if i in fillers:
+            s = max(0.0, float(w.get("start", 0)) - pad)
+            e = float(w.get("end", 0)) + pad
+            if e > s:
+                remove.append((s, e))
+    remove.sort()
+    merged = []
+    for s, e in remove:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    keep = []
+    cursor = 0.0
+    for s, e in merged:
+        if s > cursor + 0.01:
+            keep.append({"start": cursor, "end": s})
+        cursor = max(cursor, e)
+    if cursor < duration - 0.05:
+        keep.append({"start": cursor, "end": duration})
+    keep = [seg for seg in keep if seg["end"] - seg["start"] > 0.08]
+    if not keep:
+        keep = [{"start": 0, "end": duration}]
+    return keep
+
+
+# ---------- ASS SUBTITLE GEN ----------
+def _fmt_time(sec: float) -> str:
+    if sec < 0:
+        sec = 0
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+
+def _sanitize(text: str) -> str:
+    return (text or "").replace("{", "").replace("}", "").replace("\\", "").strip()
+
+
+def generate_ass(words: List[Dict], out_path: str, style: str,
+                 res_w: int, res_h: int,
+                 emphasis_set: Optional[set] = None,
+                 keep_intervals: Optional[List[Dict]] = None) -> None:
+    emphasis_set = emphasis_set or set()
+
+    if style == "tiktok":
+        font = "Impact"
+        size = int(res_h * 0.055)
+        primary = "&H00FFFFFF"
+        outline = "&H00000000"
+        emphasis_color = "&H005000FF"  # TikTok pink #FF0050 in ASS BGR
+        outline_w = 5
+        margin_v = int(res_h * 0.20)
+        alignment = 2
+        bold = -1
+    else:  # youtube clean
+        font = "Arial"
+        size = int(res_h * 0.045)
+        primary = "&H00FFFFFF"
+        outline = "&H00000000"
+        emphasis_color = "&H0000FFFF"
+        outline_w = 3
+        margin_v = int(res_h * 0.10)
+        alignment = 2
+        bold = -1
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {res_w}
+PlayResY: {res_h}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font},{size},{primary},{outline},&H00000000,{bold},0,0,0,100,100,0,0,1,{outline_w},2,{alignment},60,60,{margin_v},1
+Style: Emph,{font},{int(size*1.2)},{emphasis_color},{outline},&H00000000,{bold},0,0,0,100,100,0,0,1,{outline_w+1},3,{alignment},60,60,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    def _remap(t: float) -> Optional[float]:
+        if not keep_intervals:
+            return t
+        offset = 0.0
+        for seg in keep_intervals:
+            s, e = seg["start"], seg["end"]
+            if t < s:
+                return None
+            if t <= e:
+                return offset + (t - s)
+            offset += (e - s)
+        return None
+
+    lines = [header]
+    for i, w in enumerate(words):
+        txt = _sanitize(w.get("word", ""))
+        if not txt:
+            continue
+        start = float(w.get("start", 0))
+        end = float(w.get("end", start + 0.15))
+        rs = _remap(start)
+        re_ = _remap(end)
+        if rs is None or re_ is None or re_ <= rs:
+            continue
+        if re_ - rs < 0.12:
+            re_ = rs + 0.12
+        style_name = "Emph" if i in emphasis_set else "Default"
+        effect = r"{\fad(60,60)\t(0,80,\fscx115\fscy115)\t(80,160,\fscx100\fscy100)}"
+        if i in emphasis_set:
+            effect = r"{\fad(40,60)\t(0,100,\fscx140\fscy140)\t(100,220,\fscx110\fscy110)}"
+        lines.append(f"Dialogue: 0,{_fmt_time(rs)},{_fmt_time(re_)},{style_name},,0,0,0,,{effect}{txt}")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+# ---------- CONCAT (cut fillers) ----------
+def cut_and_concat(input_path: str, keep_segments: List[Dict], output_path: str,
+                   res_w: int = 1920, res_h: int = 1080) -> None:
+    if len(keep_segments) == 1:
+        seg = keep_segments[0]
+        full_dur = probe_video(input_path)["duration"]
+        if seg["start"] < 0.1 and abs(seg["end"] - full_dur) < 0.5:
+            cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path]
+            run_ff(cmd)
+            return
+
+    filters = []
+    parts_v = []
+    parts_a = []
+    for i, seg in enumerate(keep_segments):
+        s, e = seg["start"], seg["end"]
+        filters.append(f"[0:v]trim=start={s}:end={e},setpts=PTS-STARTPTS[v{i}]")
+        filters.append(f"[0:a]atrim=start={s}:end={e},asetpts=PTS-STARTPTS[a{i}]")
+        parts_v.append(f"[v{i}]")
+        parts_a.append(f"[a{i}]")
+    n = len(keep_segments)
+    filters.append(f"{''.join(parts_v)}concat=n={n}:v=1:a=0[vout]")
+    filters.append(f"{''.join(parts_a)}concat=n={n}:v=0:a=1[aout]")
+    filter_complex = ";".join(filters)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    run_ff(cmd)
+
+
+# ---------- FULL RENDER ----------
+def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float],
+                 broll_events: List[Dict], sfx_dir: str, output_path: str) -> None:
+    inputs = ["-i", cut_video]
+    input_idx = 1
+
+    broll_input_map = []
+    for b in broll_events:
+        local = b.get("local_path")
+        if not local or not os.path.exists(local):
+            continue
+        inputs += ["-i", local]
+        broll_input_map.append((input_idx, b))
+        input_idx += 1
+
+    whoosh_path = os.path.join(sfx_dir, "whoosh.wav")
+    has_whoosh = os.path.exists(whoosh_path) and sfx_events
+    whoosh_idx = None
+    if has_whoosh:
+        inputs += ["-i", whoosh_path]
+        whoosh_idx = input_idx
+        input_idx += 1
+
+    filters = []
+    cur = "[0:v]"
+
+    for i, (idx, b) in enumerate(broll_input_map):
+        start = b.get("out_start", 0)
+        duration = b.get("out_duration", 3.5)
+        end = start + duration
+        filters.append(
+            f"[{idx}:v]scale=iw*0.35:-2,setpts=PTS-STARTPTS+{start}/TB[br{i}]"
+        )
+        filters.append(
+            f"{cur}[br{i}]overlay=x=W-w-30:y=30:enable='between(t,{start},{end})'[vo{i}]"
+        )
+        cur = f"[vo{i}]"
+
+    if ass_file and os.path.exists(ass_file):
+        safe_ass = ass_file.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        filters.append(f"{cur}subtitles='{safe_ass}'[vsub]")
+        cur = "[vsub]"
+
+    # Ensure video has a filter-output label (needed for filter_complex mapping)
+    if cur == "[0:v]":
+        filters.append("[0:v]null[vout]")
+        cur = "[vout]"
+
+    audio_cur = "[0:a]"
+    if has_whoosh and sfx_events:
+        delays = []
+        for i, t in enumerate(sfx_events[:12]):
+            ms = max(0, int(t * 1000))
+            filters.append(f"[{whoosh_idx}:a]adelay={ms}|{ms},volume=0.3[sfx{i}]")
+            delays.append(f"[sfx{i}]")
+        if delays:
+            mix_inputs = "[0:a]" + "".join(delays)
+            filters.append(
+                f"{mix_inputs}amix=inputs={len(delays)+1}:duration=first:dropout_transition=0:normalize=0[amix]"
+            )
+            audio_cur = "[amix]"
+    else:
+        # Passthrough audio via anull so filter output label exists
+        filters.append("[0:a]anull[aout]")
+        audio_cur = "[aout]"
+
+    filter_complex = ";".join(filters) if filters else None
+
+    cmd = ["ffmpeg", "-y"] + inputs
+    if filter_complex:
+        # If audio wasn't touched by any filter, reference the stream directly without brackets
+        audio_map = audio_cur if audio_cur != "[0:a]" else "0:a"
+        cmd += ["-filter_complex", filter_complex, "-map", cur, "-map", audio_map]
+    else:
+        cmd += ["-map", "0:v", "-map", "0:a"]
+    cmd += [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart",
+        "-shortest",
+        output_path,
+    ]
+    run_ff(cmd)
+
+
+async def download_broll(url: str, dest_path: str) -> bool:
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+            async with c.stream("GET", url) as r:
+                r.raise_for_status()
+                with open(dest_path, "wb") as f:
+                    async for chunk in r.aiter_bytes(1024 * 256):
+                        f.write(chunk)
+        return os.path.getsize(dest_path) > 1024
+    except Exception as e:
+        logger.warning(f"Broll download failed {url}: {e}")
+        return False
