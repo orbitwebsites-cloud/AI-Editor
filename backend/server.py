@@ -47,7 +47,8 @@ db = client[os.environ["DB_NAME"]]
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 SFX_DIR = os.environ.get("SFX_DIR", "/app/backend/assets/sfx")
-for sub in ("videos", "audio", "output", "subtitles", "broll"):
+LIBRARY_DIR = DATA_DIR / "library"
+for sub in ("videos", "audio", "output", "subtitles", "broll", "library"):
     (DATA_DIR / sub).mkdir(parents=True, exist_ok=True)
 
 cipher = Fernet(os.environ["MASTER_ENCRYPTION_KEY"].encode())
@@ -466,6 +467,108 @@ async def analyze(pid: str, bg: BackgroundTasks):
     await update_project(pid, status="queued", status_message="Queued for analysis...", progress=1)
     bg.add_task(_run_analysis, pid)
     return {"ok": True, "status": "queued"}
+
+
+# ---------- ASSET LIBRARY (user's own vault) ----------
+LIBRARY_EXTS_VIDEO = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".gif"}
+LIBRARY_EXTS_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+LIBRARY_EXTS_ALL = LIBRARY_EXTS_VIDEO | LIBRARY_EXTS_IMAGE
+
+
+def _asset_kind(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    if ext in LIBRARY_EXTS_VIDEO: return "video"
+    if ext in LIBRARY_EXTS_IMAGE: return "image"
+    return "other"
+
+
+@api.get("/library")
+async def library_list():
+    """List all assets in the user's personal library."""
+    items = []
+    for p in sorted(LIBRARY_DIR.glob("*")):
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext not in LIBRARY_EXTS_ALL:
+            continue
+        try:
+            stat = p.stat()
+        except Exception:
+            continue
+        aid = p.stem
+        items.append({
+            "id": f"lib_{aid}",
+            "name": p.name,
+            "kind": _asset_kind(p.name),
+            "size": stat.st_size,
+            "url": f"/api/library/file/{p.name}",
+            "video_url": f"file://{p}",
+            "local_path": str(p),
+            "thumbnail": f"/api/library/thumb/{p.name}" if _asset_kind(p.name) == "image" else None,
+            "is_custom": True,
+            "provider": "library",
+        })
+    return {"items": items}
+
+
+@api.post("/library/upload")
+async def library_upload(file: UploadFile = File(...)):
+    """Upload a single asset to the personal library."""
+    fname = file.filename or "asset"
+    ext = os.path.splitext(fname)[1].lower()
+    if ext not in LIBRARY_EXTS_ALL:
+        raise HTTPException(400, f"Unsupported asset type: {ext}")
+    # Sanitize name
+    stem = re.sub(r"[^\w.-]+", "_", os.path.splitext(fname)[0])[:60] or "asset"
+    # Ensure unique
+    candidate = LIBRARY_DIR / f"{stem}{ext}"
+    i = 1
+    while candidate.exists():
+        candidate = LIBRARY_DIR / f"{stem}_{i}{ext}"
+        i += 1
+    total = 0
+    async with aiofiles.open(candidate, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 512)
+            if not chunk: break
+            await out.write(chunk); total += len(chunk)
+    if total == 0:
+        candidate.unlink(missing_ok=True)
+        raise HTTPException(400, "Empty file")
+    return {"ok": True, "name": candidate.name, "size": total, "kind": _asset_kind(candidate.name)}
+
+
+@api.delete("/library/{name}")
+async def library_delete(name: str):
+    """Delete an asset from the library (safe against path traversal)."""
+    safe = os.path.basename(name)
+    p = LIBRARY_DIR / safe
+    if not p.exists() or not p.is_file():
+        raise HTTPException(404)
+    p.unlink()
+    return {"ok": True}
+
+
+@api.get("/library/file/{name}")
+async def library_file(name: str):
+    """Serve a library file for preview."""
+    safe = os.path.basename(name)
+    p = LIBRARY_DIR / safe
+    if not p.exists() or not p.is_file():
+        raise HTTPException(404)
+    kind = _asset_kind(safe)
+    media_type = "video/mp4" if kind == "video" else "image/jpeg"
+    if safe.lower().endswith(".png"): media_type = "image/png"
+    elif safe.lower().endswith(".webp"): media_type = "image/webp"
+    elif safe.lower().endswith(".gif"): media_type = "image/gif"
+    return FileResponse(p, media_type=media_type)
+
+
+@api.get("/library/thumb/{name}")
+async def library_thumb(name: str):
+    """Serve image asset as thumbnail (same as file for now)."""
+    return await library_file(name)
 
 
 # ---------- B-ROLL SEARCH ----------

@@ -19,6 +19,7 @@ import {
     Smartphone,
     Square,
 } from "lucide-react";
+import LibraryPanel from "@/components/LibraryPanel";
 import {
     getProject,
     analyzeProject,
@@ -70,6 +71,7 @@ export default function Editor() {
     const [extractingClips, setExtractingClips] = useState(false);
     const [renderingClipLabel, setRenderingClipLabel] = useState(null);
     const [currentTime, setCurrentTime] = useState(0);
+    const [libraryPick, setLibraryPick] = useState(null);
     const videoRef = useRef();
     const transcriptRef = useRef();
     const brollFileInputRef = useRef();
@@ -608,6 +610,24 @@ export default function Editor() {
             )}
 
             {/* VIRAL CLIPS SECTION */}
+            {isReady && (
+                <LibraryPanel
+                    activeSelection={libraryPick}
+                    onPickAsset={(asset) => {
+                        // If B-roll moments exist, assign to the first unassigned one
+                        if (brollMoments.length > 0) {
+                            const firstFree = brollMoments.findIndex((_, i) => !brollSelected[i]);
+                            const idx = firstFree === -1 ? 0 : firstFree;
+                            setBrollSelected((s) => ({ ...s, [idx]: asset }));
+                            setLibraryPick(asset);
+                            toast.success(`Assigned to moment #${idx + 1}${firstFree === -1 ? " (replaced)" : ""}`);
+                        } else {
+                            setLibraryPick(libraryPick?.id === asset.id ? null : asset);
+                        }
+                    }}
+                />
+            )}
+
             {isReady && (
                 <section className="mt-12" data-testid="viral-section">
                     <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
