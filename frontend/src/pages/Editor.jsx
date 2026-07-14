@@ -18,9 +18,11 @@ import {
     Monitor,
     Smartphone,
     Square,
+    AlertTriangle,
 } from "lucide-react";
 import LibraryPanel from "@/components/LibraryPanel";
 import {
+    API,
     getProject,
     analyzeProject,
     brollSearch,
@@ -31,6 +33,7 @@ import {
     mediaOutput,
     mediaClip,
     downloadUrl,
+    apiErrorMessage,
 } from "@/lib/klipApi";
 
 const STATUS_LABELS = {
@@ -78,7 +81,10 @@ export default function Editor() {
 
     const refresh = useCallback(async () => {
         try { setProject(await getProject(id)); }
-        catch { toast.error("Project not found"); navigate("/"); }
+        catch (error) {
+            toast.error(apiErrorMessage(error, "Project not found"));
+            navigate("/");
+        }
     }, [id, navigate]);
 
     useEffect(() => { refresh(); }, [refresh]);
@@ -97,11 +103,19 @@ export default function Editor() {
         }
     }, [project, id, refresh]);
 
-    const words = project?.transcript?.words || [];
+    const words = useMemo(() => project?.transcript?.words || [], [project?.transcript?.words]);
     const analysis = project?.analysis || {};
     const autoFillers = useMemo(() => new Set(analysis.filler_indices || []), [analysis.filler_indices]);
     const emphasisSet = useMemo(() => new Set(analysis.emphasis_indices || []), [analysis.emphasis_indices]);
     const brollMoments = analysis.broll_moments || [];
+    const generatedAssets = analysis.generated_assets || [];
+
+    const previewUrl = useCallback((value) => {
+        if (!value) return "";
+        if (/^https?:\/\//i.test(value)) return value;
+        if (value.startsWith("/api/")) return `${API.replace(/\/api$/, "")}${value}`;
+        return `${API}${value.startsWith("/") ? "" : "/"}${value}`;
+    }, []);
 
     // Sync viral clips from server
     useEffect(() => {
@@ -160,7 +174,7 @@ export default function Editor() {
         try {
             const r = await brollSearch(id, query);
             setBrollByMoment((prev) => ({ ...prev, [idx]: r.results || [] }));
-        } catch (e) { toast.error("B-roll search failed"); }
+        } catch (e) { toast.error(apiErrorMessage(e, "B-roll search failed")); }
         finally { setSearchingIdx(null); }
     };
 
@@ -177,7 +191,7 @@ export default function Editor() {
             setBrollSelected((s) => ({ ...s, [idx]: r }));
             toast.success("Custom B-roll uploaded");
         } catch (e) {
-            toast.error(e?.response?.data?.detail || "B-roll upload failed");
+            toast.error(apiErrorMessage(e, "B-roll upload failed"));
         } finally {
             setUploadingBrollIdx(null);
         }
@@ -191,7 +205,7 @@ export default function Editor() {
             if (!r.clips?.length) toast.info("No viral moments found — try a longer clip");
             else toast.success(`Found ${r.clips.length} viral moments`);
         } catch (e) {
-            toast.error(e?.response?.data?.detail || "Failed to extract clips");
+            toast.error(apiErrorMessage(e, "Failed to extract clips"));
         } finally {
             setExtractingClips(false);
         }
@@ -220,7 +234,7 @@ export default function Editor() {
             toast.success(`Rendering "${clip.hook.substring(0, 40)}…"`);
             refresh();
         } catch (e) {
-            toast.error(e?.response?.data?.detail || "Clip render failed");
+            toast.error(apiErrorMessage(e, "Clip render failed"));
         } finally {
             setRenderingClipLabel(null);
         }
@@ -233,6 +247,9 @@ export default function Editor() {
             .map(([idx, v]) => ({
                 word_index: brollMoments[idx]?.word_index || 0,
                 video_url: v.video_url,
+                local_path: v.local_path,
+                is_custom: v.is_custom,
+                generated: v.generated,
             }));
         const opts = {
             style,
@@ -247,7 +264,7 @@ export default function Editor() {
             toast.success("Render started");
             refresh();
         } catch (e) {
-            toast.error(e?.response?.data?.detail || "Render failed");
+            toast.error(apiErrorMessage(e, "Render failed"));
         } finally { setRenderStarting(false); }
     };
 
@@ -260,17 +277,19 @@ export default function Editor() {
     }
 
     const inProgress = IN_PROGRESS.has(project.status);
-    const isReady = project.status === "ready" || project.status === "done";
-    const isDone = project.status === "done";
+    const isReady = project.status === "ready" || project.status === "done" || (project.status === "error" && Boolean(project.transcript));
+    // A short-form clip render also marks the project "done". Only switch the
+    // main player to the final endpoint when a main output actually exists.
+    const hasMainOutput = Boolean(project.output_path);
 
     return (
         <div className="min-h-[calc(100vh-72px)] px-4 md:px-8 py-8" data-testid="editor-page">
-            <div className="flex items-center justify-between mb-6">
-                <button onClick={() => navigate("/")} className="btn-ghost" data-testid="back-btn">
+            <div className="flex items-start justify-between mb-6 gap-4">
+                <button onClick={() => navigate("/")} className="btn-ghost !px-3 sm:!px-6" data-testid="back-btn">
                     <ArrowLeft className="w-4 h-4" /> Back
                 </button>
                 <div className="text-right">
-                    <div className="font-display text-2xl md:text-3xl tracking-wider truncate max-w-md">
+                    <div className="font-display text-xl sm:text-2xl md:text-3xl tracking-wider line-clamp-2 max-w-md">
                         {analysis.title || project.name}
                     </div>
                     <div className="font-mono text-xs text-white/40 mt-1">
@@ -304,11 +323,13 @@ export default function Editor() {
 
             {project.status === "error" && (
                 <div className="panel p-6 mb-6" style={{ borderColor: "rgba(255,51,51,0.4)" }} data-testid="error-panel">
-                    <div className="font-display text-2xl text-[#ff3333]">ERROR</div>
+                    <div className="font-display text-2xl text-[#ff3333] flex items-center gap-2"><AlertTriangle className="w-5 h-5" /> EDIT STOPPED</div>
                     <div className="text-white/70 text-sm mt-2">{project.status_message}</div>
-                    <button className="btn-ghost mt-4" onClick={() =>
-                        analyzeProject(id).then(refresh)} data-testid="retry-btn">
-                        <RefreshCw className="w-4 h-4" /> Retry Analysis
+                    <button className="btn-ghost mt-4" onClick={() => {
+                        const retry = project.transcript ? startRender() : analyzeProject(id).then(refresh);
+                        Promise.resolve(retry).catch((error) => toast.error(apiErrorMessage(error, "Retry failed")));
+                    }} data-testid="retry-btn">
+                        <RefreshCw className="w-4 h-4" /> {project.transcript ? "Retry Final Render" : "Retry Analysis"}
                     </button>
                 </div>
             )}
@@ -318,13 +339,13 @@ export default function Editor() {
                     <div className="panel">
                         <video
                             ref={videoRef}
-                            src={isDone ? mediaOutput(project.id) : mediaOriginal(project.id)}
+                            src={hasMainOutput ? mediaOutput(project.id) : mediaOriginal(project.id)}
                             controls
                             className="w-full aspect-video bg-black"
                             onTimeUpdate={(e) => setCurrentTime(e.target.currentTime)}
                             data-testid="video-player"
                         />
-                        {isDone && (
+                        {hasMainOutput && (
                             <div className="p-4 flex items-center justify-between border-t border-white/10">
                                 <div className="font-mono text-xs text-[#ccff00] tracking-widest">
                                     ✓ EDITED VERSION LOADED
@@ -416,7 +437,7 @@ export default function Editor() {
 
                     <div className="panel p-6">
                         <div className="font-mono text-xs text-white/40 tracking-widest mb-3">// STYLE</div>
-                        <div className="grid grid-cols-2 gap-2">
+                        <div className="grid grid-cols-3 gap-2">
                             <button
                                 className={`style-pill ${style === "tiktok" ? "active-tiktok" : ""}`}
                                 onClick={() => setStyle("tiktok")}
@@ -431,10 +452,19 @@ export default function Editor() {
                             >
                                 YOUTUBE
                             </button>
+                            <button
+                                className={`style-pill ${style === "luxury" ? "border-[#d4af37] text-[#d4af37]" : ""}`}
+                                onClick={() => setStyle("luxury")}
+                                data-testid="style-luxury"
+                            >
+                                LUXURY
+                            </button>
                         </div>
                         <div className="text-xs text-white/50 mt-3">
                             {style === "tiktok"
                                 ? "Bold Impact font. Pink emphasis. Bounce animations. Aggressive."
+                                : style === "luxury"
+                                ? "Editorial white captions. Gold keywords. Smooth slide-in motion."
                                 : "Clean Arial. Yellow emphasis. Subtle. Studio-look."}
                         </div>
                     </div>
@@ -490,11 +520,11 @@ export default function Editor() {
                         data-testid="render-btn"
                     >
                         {renderStarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-5 h-5" />}
-                        {isDone ? "Re-Render" : "Render Final"}
+                        {hasMainOutput ? "Re-Render" : "Render Final"}
                     </button>
 
                     <div className="text-center font-mono text-[10px] text-white/30 tracking-widest">
-                        POWERED BY GROQ · CEREBRAS · PEXELS
+                        KLIPPED STUDIO · AI-GUIDED EDITING
                     </div>
                 </aside>
                 )}
@@ -508,7 +538,8 @@ export default function Editor() {
                         {brollMoments.map((m, idx) => {
                             const results = brollByMoment[idx] || [];
                             const customs = customBrollByMoment[idx] || [];
-                            const combined = [...customs, ...results];
+                            const generated = generatedAssets.filter((asset) => asset.word_index === m.word_index);
+                            const combined = [...generated, ...customs, ...results];
                             const selected = brollSelected[idx];
                             const isUploading = uploadingBrollIdx === idx;
                             return (
@@ -532,7 +563,7 @@ export default function Editor() {
                                             ) : (
                                                 <Search className="w-3 h-3" />
                                             )}
-                                            {results.length ? "Refresh" : "Pexels"}
+                                            {results.length ? "Refresh" : "Pixabay"}
                                         </button>
                                         <label
                                             className="btn-ghost !text-xs !py-1.5 cursor-pointer"
@@ -561,6 +592,7 @@ export default function Editor() {
                                             {combined.slice(0, 6).map((r) => {
                                                 const active = selected?.id === r.id;
                                                 const isCustom = r.is_custom;
+                                                const isGenerated = r.generated;
                                                 return (
                                                     <div
                                                         key={r.id}
@@ -578,7 +610,7 @@ export default function Editor() {
                                                     >
                                                         {r.thumbnail ? (
                                                             <img
-                                                                src={r.thumbnail}
+                                                                src={previewUrl(r.thumbnail)}
                                                                 alt=""
                                                                 className="w-full h-20 object-cover"
                                                             />
@@ -587,9 +619,9 @@ export default function Editor() {
                                                                 <Film className="w-6 h-6 text-white/30" />
                                                             </div>
                                                         )}
-                                                        {isCustom && (
+                                                        {(isCustom || isGenerated) && (
                                                             <div className="absolute top-1 left-1 bg-[#CCFF00] text-black text-[9px] font-mono px-1.5">
-                                                                YOURS
+                                                                {isGenerated ? "AI MADE" : "YOURS"}
                                                             </div>
                                                         )}
                                                         {active && (
@@ -600,6 +632,11 @@ export default function Editor() {
                                                     </div>
                                                 );
                                             })}
+                                        </div>
+                                    )}
+                                    {combined.length === 0 && (
+                                        <div className="mt-3 border border-dashed border-white/10 p-4 text-center text-xs text-white/40">
+                                            Search stock, upload your own, or use an AI-made graphic when one is available.
                                         </div>
                                     )}
                                 </div>

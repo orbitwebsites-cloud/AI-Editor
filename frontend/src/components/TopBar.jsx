@@ -1,17 +1,14 @@
-import { Link, useLocation } from "react-router-dom";
-import { Settings, Sparkles, CheckCircle2, XCircle } from "lucide-react";
+import { Link } from "react-router-dom";
+import { Settings, Sparkles, CheckCircle2, XCircle, WifiOff } from "lucide-react";
 
-export default function TopBar({ keysStatus, onOpenSettings }) {
-    const loc = useLocation();
-    const configured =
-        keysStatus.groq && (keysStatus.cerebras || true) && keysStatus.pexels;
+export default function TopBar({ keysStatus, backendOnline, onOpenSettings }) {
     const groqOk = keysStatus.groq;
     return (
         <header
             className="w-full border-b border-white/10 bg-[#050505] sticky top-0 z-40"
             data-testid="top-bar"
         >
-            <div className="flex items-center justify-between px-6 py-4">
+            <div className="flex items-center justify-between px-4 sm:px-6 py-3 sm:py-4 gap-3">
                 <Link
                     to="/"
                     className="flex items-center gap-3 group"
@@ -22,18 +19,23 @@ export default function TopBar({ keysStatus, onOpenSettings }) {
                     </div>
                     <div>
                         <div className="font-heading text-2xl leading-none tracking-wider">
-                            KLIPPD
+                            KLIPPED
                         </div>
                         <div className="font-mono text-[10px] text-white/50 tracking-widest">
-                            AI EDITOR / v0.1
+                            STUDIO / BETA
                         </div>
                     </div>
                 </Link>
                 <div className="flex items-center gap-4">
+                    {backendOnline === false && (
+                        <div className="hidden sm:flex items-center gap-1.5 text-[#ff5a5a] text-[10px] font-mono tracking-wider">
+                            <WifiOff className="w-3.5 h-3.5" /> SERVER OFFLINE
+                        </div>
+                    )}
                     <div className="hidden md:flex items-center gap-3 text-xs font-mono">
                         <StatusPill label="GROQ" ok={groqOk} />
                         <StatusPill label="CEREBRAS" ok={keysStatus.cerebras} />
-                        <StatusPill label="PEXELS" ok={keysStatus.pexels} />
+                        <StatusPill label="PIXABAY" ok={keysStatus.pixabay} />
                     </div>
                     <button
                         onClick={onOpenSettings}

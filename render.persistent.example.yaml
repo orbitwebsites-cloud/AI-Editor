@@ -1,0 +1,26 @@
+# Optional paid deployment example. Do not apply this Blueprint unless persistent
+# uploads/renders are worth enabling and the paid Render service is approved.
+services:
+  - type: web
+    name: klipped-backend-persistent
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: CORS_ORIGINS
+        value: https://klippedstudio.com,https://www.klippedstudio.com
+      - key: EDITING_PROFILE
+        value: minecraft_narrative
+      - key: SEED_GROQ_KEY
+        sync: false
+      - key: SEED_CEREBRAS_KEY
+        sync: false
+      - key: SEED_PIXABAY_KEY
+        sync: false
+    disk:
+      name: klipped-data
+      mountPath: /app/data
+      sizeGB: 20

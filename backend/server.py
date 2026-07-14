@@ -8,50 +8,77 @@ Endpoints:
   GET    /api/projects/{id}            Project details
   DELETE /api/projects/{id}            Delete
   POST   /api/projects/{id}/analyze    Transcribe + LLM analyze (background)
-  POST   /api/projects/{id}/broll_search  Fetch Pexels results per moment
+  GET    /api/projects/{id}/broll_search  Fetch Pixabay results per moment
   POST   /api/projects/{id}/render     Render final video (background)
   GET    /api/projects/{id}/download   Serve final MP4
   GET    /api/media/original/{id}      Stream original video
   GET    /api/media/output/{id}        Stream output video
 """
 from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
+from fastapi import Request
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 from cryptography.fernet import Fernet
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+from typing import List, Optional, Dict, Any, Literal
 from pathlib import Path
 import os
 import re
 import json
 import logging
+import mimetypes
 import uuid
 import shutil
 import asyncio
 import aiofiles
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import ai_services as ai
+import asset_generator
 import video_processor as vp
+from local_store import LocalDatabase
 
 
 # ---------- BOOTSTRAP ----------
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
-
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
-SFX_DIR = os.environ.get("SFX_DIR", "/app/backend/assets/sfx")
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(ROOT_DIR.parent / "data"))).resolve()
+SFX_DIR = os.environ.get("SFX_DIR", str(ROOT_DIR / "assets" / "sfx"))
 LIBRARY_DIR = DATA_DIR / "library"
 for sub in ("videos", "audio", "output", "subtitles", "broll", "library"):
     (DATA_DIR / sub).mkdir(parents=True, exist_ok=True)
 
-cipher = Fernet(os.environ["MASTER_ENCRYPTION_KEY"].encode())
+mongo_url = os.environ.get("MONGO_URL", "").strip()
+if mongo_url:
+    from motor.motor_asyncio import AsyncIOMotorClient
+    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+    db = client[os.environ.get("DB_NAME", "klipped")]
+else:
+    client = None
+    db = LocalDatabase(DATA_DIR / "klipped-db.json")
+
+
+def _master_key() -> bytes:
+    configured = os.environ.get("MASTER_ENCRYPTION_KEY", "").strip()
+    if configured:
+        return configured.encode()
+    key_path = DATA_DIR / ".master-key"
+    if key_path.exists():
+        return key_path.read_bytes().strip()
+    key = Fernet.generate_key()
+    key_path.write_bytes(key)
+    return key
+
+
+cipher = Fernet(_master_key())
+
+MAX_VIDEO_BYTES = int(os.environ.get("MAX_VIDEO_BYTES", str(2 * 1024 * 1024 * 1024)))
+MAX_ASSET_BYTES = int(os.environ.get("MAX_ASSET_BYTES", str(500 * 1024 * 1024)))
+CHUNK_BYTES = 4 * 1024 * 1024
 
 USER_ID = "default_user"  # single-user MVP
 
@@ -61,6 +88,21 @@ logger = logging.getLogger("backend")
 
 app = FastAPI(title="AI Video Editor")
 api = APIRouter(prefix="/api")
+APP_ACCESS_TOKEN = os.environ.get("APP_ACCESS_TOKEN", "").strip()
+
+
+@app.middleware("http")
+async def optional_access_token(request: Request, call_next):
+    """Optional MVP gate; leave unset locally and protect public deployments."""
+    if APP_ACCESS_TOKEN and request.method != "OPTIONS" and request.url.path != "/api/health":
+        bearer = request.headers.get("authorization", "")
+        supplied = request.headers.get("x-app-token", "")
+        if bearer.lower().startswith("bearer "):
+            supplied = bearer[7:].strip()
+        import secrets
+        if not supplied or not secrets.compare_digest(supplied, APP_ACCESS_TOKEN):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 # ---------- KEY MANAGEMENT ----------
@@ -111,8 +153,8 @@ async def seed_keys_from_env():
         seed["groq"] = os.environ["SEED_GROQ_KEY"]
     if os.environ.get("SEED_CEREBRAS_KEY"):
         seed["cerebras"] = os.environ["SEED_CEREBRAS_KEY"]
-    if os.environ.get("SEED_PEXELS_KEY"):
-        seed["pexels"] = os.environ["SEED_PEXELS_KEY"]
+    if os.environ.get("SEED_PIXABAY_KEY"):
+        seed["pixabay"] = os.environ["SEED_PIXABAY_KEY"]
     if seed:
         await save_keys(seed)
         logger.info(f"Seeded keys from env: {list(seed.keys())}")
@@ -123,14 +165,13 @@ class KeysBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
     groq: Optional[str] = None
     cerebras: Optional[str] = None
-    pexels: Optional[str] = None
     pixabay: Optional[str] = None
 
 
 class RenderOptions(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    style: str = "tiktok"           # tiktok | youtube
-    aspect: str = "16:9"            # "16:9" | "9:16" | "1:1"
+    style: Literal["tiktok", "youtube", "luxury"] = "tiktok"
+    aspect: Literal["16:9", "9:16", "1:1"] = "16:9"
     remove_fillers: bool = True
     captions: bool = True
     sfx: bool = True
@@ -143,6 +184,15 @@ class RenderOptions(BaseModel):
     clip_start: Optional[float] = None
     clip_end: Optional[float] = None
     clip_label: Optional[str] = None  # used to name the output file
+
+    @model_validator(mode="after")
+    def validate_clip_window(self):
+        if (self.clip_start is None) != (self.clip_end is None):
+            raise ValueError("clip_start and clip_end must be provided together")
+        if self.clip_start is not None:
+            if self.clip_start < 0 or self.clip_end <= self.clip_start:
+                raise ValueError("clip range must have a non-negative start and end after start")
+        return self
 
 
 # ---------- HELPERS ----------
@@ -158,10 +208,63 @@ async def get_project(pid: str) -> Dict:
     return doc
 
 
+async def _save_upload(file: UploadFile, destination: Path, max_bytes: int) -> int:
+    """Stream one upload to disk with a hard size limit and atomic publish."""
+    tmp = destination.with_suffix(destination.suffix + ".uploading")
+    total = 0
+    try:
+        async with aiofiles.open(tmp, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(413, f"File exceeds the {max_bytes // (1024 * 1024)} MB limit")
+                await out.write(chunk)
+        if total == 0:
+            raise HTTPException(400, "Empty file uploaded")
+        os.replace(tmp, destination)
+        return total
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _safe_data_file(candidate: str) -> Optional[str]:
+    """Allow renderer access only to regular files inside this app's data directory."""
+    try:
+        path = Path(candidate).resolve(strict=True)
+        root = DATA_DIR.resolve(strict=True)
+        if not path.is_file() or not path.is_relative_to(root):
+            return None
+        return str(path)
+    except (OSError, RuntimeError):
+        return None
+
+
 # ---------- ROUTES: KEYS ----------
 @api.get("/")
 async def root():
-    return {"ok": True, "app": "AI Video Editor", "version": "0.1.0"}
+    return {"ok": True, "app": "Klipped Studio", "version": "0.2.0"}
+
+
+@api.get("/health")
+async def health():
+    """Deployment readiness check for database, FFmpeg and persistent storage."""
+    checks = {
+        "ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
+        "storage": DATA_DIR.exists() and os.access(DATA_DIR, os.W_OK),
+        "database": False,
+    }
+    try:
+        await db.command("ping")
+        checks["database"] = True
+    except Exception:
+        pass
+    if not all(checks.values()):
+        raise HTTPException(503, detail={"ok": False, "checks": checks})
+    return {"ok": True, "checks": checks}
 
 
 @api.get("/keys/status")
@@ -170,7 +273,6 @@ async def keys_status():
     return {
         "groq": bool(keys.get("groq")),
         "cerebras": bool(keys.get("cerebras")),
-        "pexels": bool(keys.get("pexels")),
         "pixabay": bool(keys.get("pixabay")),
     }
 
@@ -187,13 +289,12 @@ async def set_keys(body: KeysBody):
 @api.post("/keys/test")
 async def test_keys():
     k = await get_keys()
-    g, c, p, pb = await asyncio.gather(
+    g, c, pb = await asyncio.gather(
         ai.test_groq(k.get("groq", "")),
         ai.test_cerebras(k.get("cerebras", "")),
-        ai.test_pexels(k.get("pexels", "")),
         ai.test_pixabay(k.get("pixabay", "")),
     )
-    return {"groq": g, "cerebras": c, "pexels": p, "pixabay": pb}
+    return {"groq": g, "cerebras": c, "pixabay": pb}
 
 
 # ---------- ROUTES: PROJECTS ----------
@@ -206,18 +307,7 @@ async def upload_project(file: UploadFile = File(...)):
         raise HTTPException(400, f"Unsupported video type: {ext}")
     dst = DATA_DIR / "videos" / f"{pid}{ext}"
 
-    total = 0
-    async with aiofiles.open(dst, "wb") as out:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            await out.write(chunk)
-            total += len(chunk)
-
-    if total == 0:
-        dst.unlink(missing_ok=True)
-        raise HTTPException(400, "Empty file uploaded")
+    total = await _save_upload(file, dst, MAX_VIDEO_BYTES)
 
     # Probe
     try:
@@ -263,6 +353,14 @@ async def list_projects():
 # ---------- CHUNKED UPLOAD (for large files bypassing ingress 413) ----------
 UPLOAD_TMP = DATA_DIR / "uploads_tmp"
 UPLOAD_TMP.mkdir(parents=True, exist_ok=True)
+upload_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _upload_lock(upload_id: str) -> asyncio.Lock:
+    """Serialize writes to the manifest for one resumable upload."""
+    if upload_id not in upload_locks:
+        upload_locks[upload_id] = asyncio.Lock()
+    return upload_locks[upload_id]
 
 
 class UploadInit(BaseModel):
@@ -279,6 +377,11 @@ async def upload_init(body: UploadInit):
         raise HTTPException(400, f"Unsupported video type: {ext}")
     if body.size <= 0 or body.total_chunks <= 0:
         raise HTTPException(400, "Invalid size/chunks")
+    if body.size > MAX_VIDEO_BYTES:
+        raise HTTPException(413, f"Video exceeds the {MAX_VIDEO_BYTES // (1024 * 1024)} MB limit")
+    expected_chunks = max(1, (body.size + CHUNK_BYTES - 1) // CHUNK_BYTES)
+    if body.total_chunks != expected_chunks:
+        raise HTTPException(400, "Invalid chunk manifest")
     upload_id = uuid.uuid4().hex
     session_dir = UPLOAD_TMP / upload_id
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -302,21 +405,35 @@ async def upload_chunk(upload_id: str, index: int, file: UploadFile = File(...))
     manifest_path = session_dir / "manifest.json"
     if not manifest_path.exists():
         raise HTTPException(404, "Upload session not found")
-    chunk_path = session_dir / f"chunk_{index:06d}"
-    async with aiofiles.open(chunk_path, "wb") as out:
-        while True:
-            data = await file.read(1024 * 512)
-            if not data:
-                break
-            await out.write(data)
-    # Update manifest
-    async with aiofiles.open(manifest_path, "r") as f:
-        m = json.loads(await f.read())
-    if index not in m["received_chunks"]:
-        m["received_chunks"].append(index)
-    async with aiofiles.open(manifest_path, "w") as f:
-        await f.write(json.dumps(m))
-    return {"ok": True, "received": len(m["received_chunks"]), "total": m["total_chunks"]}
+    async with _upload_lock(upload_id):
+        async with aiofiles.open(manifest_path, "r") as f:
+            m = json.loads(await f.read())
+        if index < 0 or index >= m["total_chunks"]:
+            raise HTTPException(400, "Chunk index is out of range")
+        expected_size = min(CHUNK_BYTES, m["size"] - index * CHUNK_BYTES)
+        tmp_path = session_dir / f"chunk_{index:06d}.uploading"
+        chunk_path = session_dir / f"chunk_{index:06d}"
+        total = 0
+        async with aiofiles.open(tmp_path, "wb") as out:
+            while True:
+                data = await file.read(1024 * 512)
+                if not data:
+                    break
+                total += len(data)
+                if total > expected_size:
+                    tmp_path.unlink(missing_ok=True)
+                    raise HTTPException(400, "Chunk is larger than expected")
+                await out.write(data)
+        if total != expected_size:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(400, f"Invalid chunk size: expected {expected_size}, got {total}")
+        os.replace(tmp_path, chunk_path)
+        if index not in m["received_chunks"]:
+            m["received_chunks"].append(index)
+        m["received_chunks"] = sorted(set(m["received_chunks"]))
+        async with aiofiles.open(manifest_path, "w") as f:
+            await f.write(json.dumps(m))
+        return {"ok": True, "received": len(m["received_chunks"]), "total": m["total_chunks"]}
 
 
 @api.get("/uploads/status/{upload_id}")
@@ -342,43 +459,41 @@ async def upload_finalize(upload_id: str):
     manifest_path = session_dir / "manifest.json"
     if not manifest_path.exists():
         raise HTTPException(404, "Upload session not found")
-    async with aiofiles.open(manifest_path, "r") as f:
-        m = json.loads(await f.read())
-    if len(m["received_chunks"]) != m["total_chunks"]:
-        raise HTTPException(400,
-            f"Missing chunks: got {len(m['received_chunks'])}/{m['total_chunks']}")
+    async with _upload_lock(upload_id):
+        async with aiofiles.open(manifest_path, "r") as f:
+            m = json.loads(await f.read())
+        expected_indices = list(range(m["total_chunks"]))
+        if sorted(m["received_chunks"]) != expected_indices:
+            raise HTTPException(400, f"Upload is incomplete: got {len(m['received_chunks'])}/{m['total_chunks']} chunks")
 
-    pid = str(uuid.uuid4())
-    ext = m["ext"]
-    dst = DATA_DIR / "videos" / f"{pid}{ext}"
-
-    # Concatenate chunks in order
-    total = 0
-    async with aiofiles.open(dst, "wb") as out:
-        for i in range(m["total_chunks"]):
-            chunk_path = session_dir / f"chunk_{i:06d}"
-            if not chunk_path.exists():
-                dst.unlink(missing_ok=True)
-                raise HTTPException(400, f"Chunk {i} missing on disk")
-            async with aiofiles.open(chunk_path, "rb") as inp:
-                while True:
-                    data = await inp.read(1024 * 1024)
-                    if not data:
-                        break
-                    await out.write(data)
-                    total += len(data)
-
-    # Clean up session dir
-    try:
-        shutil.rmtree(session_dir)
-    except Exception:
-        pass
+        pid = str(uuid.uuid4())
+        ext = m["ext"]
+        dst = DATA_DIR / "videos" / f"{pid}{ext}"
+        total = 0
+        async with aiofiles.open(dst, "wb") as out:
+            for i in expected_indices:
+                chunk_path = session_dir / f"chunk_{i:06d}"
+                if not chunk_path.exists():
+                    dst.unlink(missing_ok=True)
+                    raise HTTPException(400, f"Chunk {i} is missing on disk")
+                async with aiofiles.open(chunk_path, "rb") as inp:
+                    while True:
+                        data = await inp.read(1024 * 1024)
+                        if not data:
+                            break
+                        await out.write(data)
+                        total += len(data)
+        if total != m["size"]:
+            dst.unlink(missing_ok=True)
+            raise HTTPException(400, f"Assembled upload size mismatch: expected {m['size']}, got {total}")
 
     try:
         meta = vp.probe_video(str(dst))
     except Exception as e:
         dst.unlink(missing_ok=True)
         raise HTTPException(400, f"Could not read assembled video ({ext}): {str(e)[:200]}")
+    shutil.rmtree(session_dir, ignore_errors=True)
+    upload_locks.pop(upload_id, None)
 
     project = {
         "id": pid,
@@ -451,7 +566,45 @@ async def _run_analysis(pid: str):
                              status="analyzing",
                              status_message="AI analyzing for fillers, emphasis, B-roll...")
 
-        analysis = await ai.analyze_transcript(transcript.get("words", []), keys)
+        profile = os.environ.get("EDITING_PROFILE", "")
+        analysis = await ai.analyze_transcript(transcript.get("words", []), keys, profile=profile)
+        quality_review = analysis.get("quality_review", {})
+        if not quality_review.get("passed"):
+            issue_codes = [
+                str(issue.get("code")) for issue in quality_review.get("remaining_issues", [])
+                if isinstance(issue, dict) and issue.get("code")
+            ]
+            summary = ", ".join(issue_codes[:3]) or "semantic quality threshold not met"
+            await update_project(
+                pid,
+                analysis=analysis,
+                progress=100,
+                status="error",
+                status_message=(
+                    f"Edit plan needs review after {quality_review.get('llm_attempt_count', 1)} "
+                    f"AI attempt(s): {summary}"
+                ),
+            )
+            return
+        await update_project(pid, progress=82,
+                             status_message="Building the edit plan and missing graphics...")
+        generated_assets = await asyncio.to_thread(
+            asset_generator.generate_assets,
+            analysis.get("asset_requests", []), pid, LIBRARY_DIR,
+        )
+        analysis["generated_assets"] = generated_assets
+        # A generated graphic must always have a visible picker moment even if
+        # the model returned slightly mismatched arrays.
+        existing_indices = {m.get("word_index") for m in analysis.get("broll_moments", [])}
+        for asset in generated_assets:
+            if asset["word_index"] not in existing_indices:
+                analysis.setdefault("broll_moments", []).append({
+                    "word_index": asset["word_index"],
+                    "query": asset["asset_kind"].replace("_", " "),
+                    "reason": asset.get("reason") or "Klipped created a graphic for this beat.",
+                    "visual_intent": "Clarify the idea without unrelated stock footage.",
+                })
+                existing_indices.add(asset["word_index"])
         await update_project(pid, analysis=analysis, progress=100, status="ready",
                              status_message="Ready to edit & render")
     except Exception as e:
@@ -471,7 +624,7 @@ async def analyze(pid: str, bg: BackgroundTasks):
 
 # ---------- ASSET LIBRARY (user's own vault) ----------
 LIBRARY_EXTS_VIDEO = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".gif"}
-LIBRARY_EXTS_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+LIBRARY_EXTS_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".svg"}
 LIBRARY_EXTS_ALL = LIBRARY_EXTS_VIDEO | LIBRARY_EXTS_IMAGE
 
 
@@ -527,15 +680,7 @@ async def library_upload(file: UploadFile = File(...)):
     while candidate.exists():
         candidate = LIBRARY_DIR / f"{stem}_{i}{ext}"
         i += 1
-    total = 0
-    async with aiofiles.open(candidate, "wb") as out:
-        while True:
-            chunk = await file.read(1024 * 512)
-            if not chunk: break
-            await out.write(chunk); total += len(chunk)
-    if total == 0:
-        candidate.unlink(missing_ok=True)
-        raise HTTPException(400, "Empty file")
+    total = await _save_upload(file, candidate, MAX_ASSET_BYTES)
     return {"ok": True, "name": candidate.name, "size": total, "kind": _asset_kind(candidate.name)}
 
 
@@ -562,6 +707,7 @@ async def library_file(name: str):
     if safe.lower().endswith(".png"): media_type = "image/png"
     elif safe.lower().endswith(".webp"): media_type = "image/webp"
     elif safe.lower().endswith(".gif"): media_type = "image/gif"
+    elif safe.lower().endswith(".svg"): media_type = "image/svg+xml"
     return FileResponse(p, media_type=media_type)
 
 
@@ -574,26 +720,20 @@ async def library_thumb(name: str):
 # ---------- B-ROLL SEARCH ----------
 @api.get("/projects/{pid}/broll_search")
 async def broll_search(pid: str, query: str, per_page: int = 6, orientation: str = "landscape"):
-    """Merges Pexels + Pixabay results (Pixabay first - higher quality)."""
+    """Search Pixabay for stock B-roll clips."""
+    await get_project(pid)
+    query = re.sub(r"\s+", " ", query).strip()[:80]
+    if not query:
+        raise HTTPException(400, "Search query is required")
     keys = await get_keys()
-    px_orient = "landscape" if orientation != "vertical" else "portrait"
     pb_orient = "vertical" if orientation == "vertical" else "horizontal"
-    pexels_task = ai.search_pexels_video(query, keys.get("pexels", ""), per_page=per_page, orientation=px_orient)
-    pixabay_task = ai.search_pixabay_video(query, keys.get("pixabay", ""), per_page=per_page, orientation=pb_orient)
-    pex, pix = await asyncio.gather(pexels_task, pixabay_task, return_exceptions=True)
-    pex = pex if isinstance(pex, list) else []
-    pix = pix if isinstance(pix, list) else []
-    # Interleave (Pixabay first — better curation) then Pexels
-    merged = []
-    for i in range(max(len(pix), len(pex))):
-        if i < len(pix): merged.append(pix[i])
-        if i < len(pex): merged.append(pex[i])
-    return {"query": query, "results": merged, "counts": {"pixabay": len(pix), "pexels": len(pex)}}
+    results = await ai.search_pixabay_video(query, keys.get("pixabay", ""), per_page=per_page, orientation=pb_orient)
+    return {"query": query, "results": results, "counts": {"pixabay": len(results)}}
 
 
 @api.post("/projects/{pid}/broll_upload")
 async def broll_upload(pid: str, file: UploadFile = File(...)):
-    """Accept a user-uploaded B-roll clip; return a Pexels-shaped result object."""
+    """Accept a user-uploaded B-roll clip for use in a render."""
     await get_project(pid)  # validate exists
     ext = os.path.splitext(file.filename or "clip.mp4")[1].lower() or ".mp4"
     if ext not in {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}:
@@ -601,17 +741,7 @@ async def broll_upload(pid: str, file: UploadFile = File(...)):
     clip_id = f"user_{uuid.uuid4().hex[:8]}"
     dst = DATA_DIR / "broll" / f"{pid}_{clip_id}{ext}"
 
-    total = 0
-    async with aiofiles.open(dst, "wb") as out:
-        while True:
-            chunk = await file.read(1024 * 512)
-            if not chunk:
-                break
-            await out.write(chunk)
-            total += len(chunk)
-    if total == 0:
-        dst.unlink(missing_ok=True)
-        raise HTTPException(400, "Empty file uploaded")
+    total = await _save_upload(file, dst, MAX_ASSET_BYTES)
 
     try:
         meta = vp.probe_video(str(dst))
@@ -619,7 +749,7 @@ async def broll_upload(pid: str, file: UploadFile = File(...)):
         dst.unlink(missing_ok=True)
         raise HTTPException(400, f"Could not read B-roll: {str(e)[:200]}")
 
-    # Return Pexels-compatible shape; video_url is our own media path
+    # Return the same shape used by the asset picker; the renderer reads this path directly.
     backend_base = os.environ.get("PUBLIC_BACKEND_URL", "").rstrip("/")
     video_url = f"file://{dst}"  # Backend can read local file:// directly
     return {
@@ -721,15 +851,28 @@ async def _run_render(pid: str, opts: RenderOptions):
                 moment_word_idx = int(sel.get("word_index", 0))
                 if not url:
                     continue
-                # Handle custom (already-local) vs Pexels (needs download)
+                # Handle custom (already-local) versus a remote Pixabay clip.
                 if url.startswith("file://") or sel.get("is_custom"):
-                    local = sel.get("local_path") or url.replace("file://", "")
-                    if not os.path.exists(local):
+                    requested = sel.get("local_path") or url.replace("file://", "")
+                    local = _safe_data_file(requested)
+                    if not local:
+                        logger.warning("Rejected unsafe or missing local asset for project %s", pid)
                         continue
                 else:
+                    parsed_url = urlparse(url)
+                    host = (parsed_url.hostname or "").lower()
+                    if parsed_url.scheme != "https" or not (host == "pixabay.com" or host.endswith(".pixabay.com")):
+                        logger.warning("Rejected non-Pixabay B-roll URL for project %s", pid)
+                        continue
                     local = str(DATA_DIR / "broll" / f"{pid}_broll_{i}.mp4")
-                    ok = await vp.download_broll(url, local)
+                    ok = await vp.download_broll(url, local, MAX_ASSET_BYTES)
                     if not ok:
+                        continue
+                    try:
+                        await asyncio.to_thread(vp.probe_video, local)
+                    except Exception:
+                        Path(local).unlink(missing_ok=True)
+                        logger.warning("Rejected unreadable Pixabay clip for project %s", pid)
                         continue
                 # Compute output time from word index remap
                 if moment_word_idx < len(words):
@@ -754,6 +897,11 @@ async def _run_render(pid: str, opts: RenderOptions):
                     "local_path": local,
                     "out_start": max(0, out_t),
                     "out_duration": 3.5,
+                    "fit": (
+                        "full" if sel.get("generated") else
+                        "pip" if Path(local).suffix.lower() in LIBRARY_EXTS_IMAGE else
+                        "cover"
+                    ),
                 })
 
         await update_project(pid, progress=70, status_message="Rendering final video...")
@@ -768,6 +916,13 @@ async def _run_render(pid: str, opts: RenderOptions):
         await asyncio.to_thread(vp.render_final, cut_path, ass_path, sfx_events,
                                 broll_events, SFX_DIR, output_path)
 
+        # Never mark a broken or empty render as complete. This is the first
+        # quality gate in the editing loop; later reference scoring can build
+        # on top of a technically valid output.
+        output_meta = await asyncio.to_thread(vp.probe_video, output_path)
+        if output_meta.get("duration", 0) <= 0 or output_meta.get("width", 0) <= 0 or output_meta.get("size", 0) < 1024:
+            raise RuntimeError("Render validation failed: output has no playable video stream")
+
         # Cleanup intermediate
         try:
             os.remove(cut_path)
@@ -775,7 +930,7 @@ async def _run_render(pid: str, opts: RenderOptions):
             pass
 
         update_fields = {"status": "done", "progress": 100,
-                         "status_message": "Render complete!"}
+                         "status_message": "Render complete!", "output_meta": output_meta}
         if opts.clip_label:
             # Track in viral_renders dict on project
             proj_now = await get_project(pid)
@@ -796,6 +951,10 @@ async def render(pid: str, opts: RenderOptions, bg: BackgroundTasks):
     proj = await get_project(pid)
     if not proj.get("transcript"):
         raise HTTPException(400, "Project not analyzed yet")
+    if proj.get("status") in ("queued_render", "rendering"):
+        return {"ok": True, "status": proj["status"], "already_running": True}
+    if opts.clip_end is not None and opts.clip_end > float(proj.get("duration") or 0) + 0.1:
+        raise HTTPException(400, "Clip end exceeds the source duration")
     await update_project(pid, status="queued_render",
                          status_message="Render queued...", progress=1)
     bg.add_task(_run_render, pid, opts)
@@ -843,7 +1002,7 @@ async def media_original(pid: str):
     p = proj.get("original_path")
     if not p or not os.path.exists(p):
         raise HTTPException(404)
-    return FileResponse(p, media_type="video/mp4")
+    return FileResponse(p, media_type=mimetypes.guess_type(p)[0] or "application/octet-stream")
 
 
 @api.get("/media/output/{pid}")
@@ -857,10 +1016,11 @@ async def media_output(pid: str):
 
 # ---------- APP WIRING ----------
 app.include_router(api)
+cors_origins = [origin.strip() for origin in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials="*" not in cors_origins,
+    allow_origins=cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -868,4 +1028,5 @@ app.add_middleware(
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client is not None:
+        client.close()

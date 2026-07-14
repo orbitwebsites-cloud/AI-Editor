@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Upload, Loader2, Trash2, Image as ImageIcon, Film } from "lucide-react";
+import { Upload, Loader2, Trash2, Image as ImageIcon, Film, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
-import { API } from "@/lib/klipApi";
+import { API, apiErrorMessage } from "@/lib/klipApi";
 import axios from "axios";
 
 const api = axios.create({ baseURL: API });
@@ -10,14 +10,17 @@ export default function LibraryPanel({ onPickAsset, activeSelection }) {
     const [items, setItems] = useState([]);
     const [uploading, setUploading] = useState(false);
     const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState(false);
     const inputRef = useRef();
 
     const refresh = async () => {
         try {
             const { data } = await api.get("/library");
             setItems(data.items || []);
+            setLoadError(false);
         } catch (e) {
             console.error("library fetch failed", e);
+            setLoadError(true);
         } finally { setLoading(false); }
     };
 
@@ -26,22 +29,30 @@ export default function LibraryPanel({ onPickAsset, activeSelection }) {
     const handleFiles = async (files) => {
         if (!files || !files.length) return;
         setUploading(true);
+        let completed = 0;
         try {
             for (const f of files) {
                 const fd = new FormData();
                 fd.append("file", f);
                 try {
                     await api.post("/library/upload", fd, {
-                        headers: { "Content-Type": "multipart/form-data" },
                         timeout: 0,
                     });
+                    completed += 1;
                 } catch (e) {
-                    toast.error(`${f.name}: ${e?.response?.data?.detail || "upload failed"}`);
+                    toast.error(`${f.name}: ${apiErrorMessage(e, "upload failed")}`);
                 }
             }
-            toast.success(`Uploaded ${files.length} asset(s)`);
-            refresh();
+            if (completed) toast.success(`Uploaded ${completed} asset${completed === 1 ? "" : "s"}`);
+            await refresh();
         } finally { setUploading(false); }
+    };
+
+    const assetUrl = (value) => {
+        if (!value) return "";
+        if (/^https?:\/\//i.test(value)) return value;
+        if (value.startsWith("/api/")) return `${API.replace(/\/api$/, "")}${value}`;
+        return `${API}${value.startsWith("/") ? "" : "/"}${value}`;
     };
 
     const deleteItem = async (name) => {
@@ -81,6 +92,13 @@ export default function LibraryPanel({ onPickAsset, activeSelection }) {
 
             {loading ? (
                 <div className="panel p-8 text-center text-white/40 font-mono text-sm">Loading...</div>
+            ) : loadError ? (
+                <div className="panel p-8 text-center text-white/50 font-mono text-sm" role="alert">
+                    Your asset library could not be loaded.
+                    <button className="btn-ghost mx-auto mt-4" onClick={() => { setLoading(true); refresh(); }}>
+                        <RefreshCw className="w-4 h-4" /> Try again
+                    </button>
+                </div>
             ) : items.length === 0 ? (
                 <div
                     className="panel p-12 text-center cursor-pointer hover:bg-white/[0.02] transition-colors border-dashed"
@@ -108,13 +126,13 @@ export default function LibraryPanel({ onPickAsset, activeSelection }) {
                                 <div className="aspect-square bg-black flex items-center justify-center overflow-hidden">
                                     {it.kind === "image" ? (
                                         <img
-                                            src={`${API}${it.url}`}
+                                            src={assetUrl(it.url)}
                                             alt={it.name}
                                             className="w-full h-full object-cover"
                                         />
                                     ) : (
                                         <video
-                                            src={`${API}${it.url}`}
+                                            src={assetUrl(it.url)}
                                             muted
                                             loop
                                             playsInline
@@ -151,7 +169,7 @@ export default function LibraryPanel({ onPickAsset, activeSelection }) {
             )}
             {items.length > 0 && activeSelection && (
                 <div className="mt-4 p-3 panel font-mono text-xs text-[#CCFF00] text-center">
-                    ✓ &quot;{activeSelection.name}&quot; is queued. Assign it to a moment below.
+                    ✓ &quot;{activeSelection.name}&quot; is assigned to a B-roll moment.
                 </div>
             )}
         </section>

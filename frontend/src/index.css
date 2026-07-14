@@ -92,6 +92,24 @@ body::before {
   gap: 0.5rem;
 }
 .btn-ghost:hover { border-color: var(--brand); background: rgba(204,255,0,0.05); }
+.btn-ghost:disabled { opacity: 0.45; cursor: not-allowed; }
+
+button:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
 
 .panel {
   background: var(--panel);

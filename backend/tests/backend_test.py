@@ -4,7 +4,13 @@ import time
 import requests
 import pytest
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://freelance-film-hack.preview.emergentagent.com").rstrip("/")
+if os.environ.get("RUN_BACKEND_E2E") != "1":
+    pytest.skip(
+        "Set RUN_BACKEND_E2E=1 with a running API, FFmpeg test video, and provider keys.",
+        allow_module_level=True,
+    )
+
+BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 API = f"{BASE_URL}/api"
 TEST_VIDEO = "/tmp/test.mp4"
 
@@ -30,13 +36,13 @@ class TestRootAndKeys:
         assert r.status_code == 200
         j = r.json()
         assert j["ok"] is True
-        assert j["app"] == "AI Video Editor"
+        assert j["app"] == "Klipped Studio"
 
     def test_keys_status(self):
         r = requests.get(f"{API}/keys/status", timeout=10)
         assert r.status_code == 200
         j = r.json()
-        assert j == {"groq": True, "cerebras": True, "pexels": True}
+        assert j == {"groq": True, "cerebras": True, "pixabay": True}
 
     def test_keys_test(self):
         r = requests.post(f"{API}/keys/test", timeout=60)
@@ -46,22 +52,23 @@ class TestRootAndKeys:
         assert "model" in j["groq"]
         assert j["cerebras"]["ok"] is True, j["cerebras"]
         assert "model" in j["cerebras"]
-        assert j["pexels"]["ok"] is True, j["pexels"]
+        assert j["pixabay"]["ok"] is True, j["pixabay"]
 
     def test_keys_update_no_downgrade(self):
         # Post empty dict-ish - should 400
         r = requests.post(f"{API}/keys", json={}, timeout=10)
         assert r.status_code == 400
-        # Post a dummy update to pexels; status still true
-        r2 = requests.post(f"{API}/keys", json={"pexels": "dummy_ignored_val_xyz"}, timeout=10)
+        # Post a dummy update to Pixabay; status should remain configured.
+        r2 = requests.post(f"{API}/keys", json={"pixabay": "dummy_ignored_val_xyz"}, timeout=10)
         assert r2.status_code == 200
-        assert "pexels" in r2.json()["updated"]
+        assert "pixabay" in r2.json()["updated"]
         # Status still returns true
         r3 = requests.get(f"{API}/keys/status", timeout=10)
-        assert r3.json()["pexels"] is True
+        assert r3.json()["pixabay"] is True
         # Restore real key
-        real = os.environ.get("SEED_PEXELS_KEY") or "tuFDx6DCYVTqLSq9xu5mGt2g8wFVNi9xcxBVGyP23WCwA5QeLSpF9fC0"
-        requests.post(f"{API}/keys", json={"pexels": real}, timeout=10)
+        real = os.environ.get("SEED_PIXABAY_KEY")
+        if real:
+            requests.post(f"{API}/keys", json={"pixabay": real}, timeout=10)
 
 
 # ---------- Projects CRUD ----------

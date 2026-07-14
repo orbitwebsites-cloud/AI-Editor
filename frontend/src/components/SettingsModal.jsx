@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { X, Key, ExternalLink, CheckCircle2, XCircle, Loader2 } from "lucide-react";
-import { getKeysStatus, saveKeys, testKeys } from "@/lib/klipApi";
+import { apiErrorMessage, getKeysStatus, saveKeys, testKeys } from "@/lib/klipApi";
 import { toast } from "sonner";
 
 const PROVIDERS = [
@@ -21,14 +21,6 @@ const PROVIDERS = [
         required: false,
     },
     {
-        id: "pexels",
-        name: "Pexels",
-        role: "B-roll Stock (fallback)",
-        url: "https://www.pexels.com/api/",
-        placeholder: "563492ad6f...",
-        required: false,
-    },
-    {
         id: "pixabay",
         name: "Pixabay",
         role: "B-roll Stock (recommended)",
@@ -39,16 +31,18 @@ const PROVIDERS = [
 ];
 
 export default function SettingsModal({ open, onClose, onSaved }) {
-    const [values, setValues] = useState({ groq: "", cerebras: "", pexels: "", pixabay: "" });
-    const [status, setStatus] = useState({ groq: false, cerebras: false, pexels: false, pixabay: false });
+    const [values, setValues] = useState({ groq: "", cerebras: "", pixabay: "" });
+    const [status, setStatus] = useState({ groq: false, cerebras: false, pixabay: false });
     const [testResults, setTestResults] = useState(null);
     const [testing, setTesting] = useState(false);
     const [saving, setSaving] = useState(false);
 
     useEffect(() => {
         if (open) {
-            getKeysStatus().then(setStatus).catch(() => {});
-            setValues({ groq: "", cerebras: "", pexels: "", pixabay: "" });
+            getKeysStatus().then(setStatus).catch((error) => {
+                toast.error(apiErrorMessage(error, "Could not load key status"));
+            });
+            setValues({ groq: "", cerebras: "", pixabay: "" });
             setTestResults(null);
         }
     }, [open]);
@@ -59,7 +53,7 @@ export default function SettingsModal({ open, onClose, onSaved }) {
         setSaving(true);
         const payload = {};
         for (const p of PROVIDERS) {
-            if (values[p.id]) payload[p.id] = values[p.id];
+            if (values[p.id]?.trim()) payload[p.id] = values[p.id].trim();
         }
         if (Object.keys(payload).length === 0) {
             toast.error("Paste at least one key");
@@ -72,9 +66,9 @@ export default function SettingsModal({ open, onClose, onSaved }) {
             setStatus(fresh);
             onSaved?.();
             toast.success("Keys locked in");
-            setValues({ groq: "", cerebras: "", pexels: "", pixabay: "" });
+            setValues({ groq: "", cerebras: "", pixabay: "" });
         } catch (e) {
-            toast.error("Save failed");
+            toast.error(apiErrorMessage(e, "Save failed"));
         } finally {
             setSaving(false);
         }
@@ -90,7 +84,7 @@ export default function SettingsModal({ open, onClose, onSaved }) {
             if (allOk) toast.success("All configured keys work!");
             else toast.error("Some keys failed — check details below");
         } catch (e) {
-            toast.error("Test failed");
+            toast.error(apiErrorMessage(e, "Connection test failed"));
         } finally {
             setTesting(false);
         }
@@ -101,16 +95,21 @@ export default function SettingsModal({ open, onClose, onSaved }) {
             className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
             onClick={onClose}
             data-testid="settings-modal-backdrop"
+            role="presentation"
         >
             <div
                 className="w-full max-w-2xl bg-[#111] border border-white/15 relative"
                 onClick={(e) => e.stopPropagation()}
                 data-testid="settings-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="settings-title"
             >
                 <button
                     onClick={onClose}
                     className="absolute top-4 right-4 text-white/50 hover:text-white transition"
                     data-testid="close-settings-btn"
+                    aria-label="Close API key settings"
                 >
                     <X className="w-5 h-5" />
                 </button>
@@ -118,17 +117,17 @@ export default function SettingsModal({ open, onClose, onSaved }) {
                 <div className="p-8 border-b border-white/10">
                     <div className="flex items-center gap-3 mb-2">
                         <Key className="w-6 h-6 text-[#ccff00]" />
-                        <h2 className="font-heading text-3xl tracking-wider">
+                        <h2 id="settings-title" className="font-heading text-3xl tracking-wider">
                             API KEYS
                         </h2>
                     </div>
                     <p className="text-white/60 text-sm">
                         Paste your free-tier keys — we encrypt them before storing.
-                        Groq is required, Cerebras is fallback, Pexels enables B-roll.
+                        Groq is required, Cerebras is fallback, and Pixabay enables stock B-roll.
                     </p>
                 </div>
 
-                <div className="p-8 space-y-8 max-h-[60vh] overflow-y-auto">
+                <div className="p-5 sm:p-8 space-y-8 max-h-[60vh] overflow-y-auto">
                     {PROVIDERS.map((p) => {
                         const configured = status[p.id];
                         const testResult = testResults?.[p.id];
@@ -173,6 +172,8 @@ export default function SettingsModal({ open, onClose, onSaved }) {
                                         setValues((v) => ({ ...v, [p.id]: e.target.value }))
                                     }
                                     data-testid={`key-input-${p.id}`}
+                                    aria-label={`${p.name} API key`}
+                                    autoComplete="off"
                                 />
                                 {testResult && (
                                     <div
@@ -193,7 +194,7 @@ export default function SettingsModal({ open, onClose, onSaved }) {
                     })}
                 </div>
 
-                <div className="p-6 border-t border-white/10 flex items-center justify-between gap-3">
+                <div className="p-4 sm:p-6 border-t border-white/10 flex flex-col-reverse sm:flex-row items-stretch sm:items-center justify-between gap-3">
                     <button
                         onClick={handleTest}
                         disabled={testing}

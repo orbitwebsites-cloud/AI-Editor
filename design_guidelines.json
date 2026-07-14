@@ -100,8 +100,8 @@
     "Shadcn UI can be used for complex components (Dialogs, Select) but MUST be customized to remove rounded corners and soft shadows.",
     "Implement the transcription area as a scrollable timeline with 'karaoke' active word highlighting.",
     "Include a 'Style Picker' that drastically changes the caption preview visualization (TikTok vs YouTube).",
-    "Never use generic placeholders. Use the provided Pexels-style image URLs for B-roll previews.",
-    "Build a custom settings modal for Groq/Cerebras/Pexels API keys.",
+    "Never use generic placeholders. Use real Pixabay or personal-library assets for B-roll previews.",
+    "Build a custom settings modal for Groq, Cerebras, and Pixabay API keys.",
     "DO NOT use transparent backgrounds for dropdowns or modals over content."
   ],
   "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [

@@ -1,0 +1,7 @@
+*
+!backend/
+!backend/**
+!training/
+!training/editing_knowledge_v1.json
+backend/__pycache__/
+backend/tests/

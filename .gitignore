@@ -82,9 +82,21 @@ memory/test_credentials.md
 android-sdk/data/videos/9184b36b-7bed-49cc-b41f-9164110b7bb6.mov
 .env
 .env.*
+!.env.example
 *.env
 credentials.json
 *.key
 .credentials
 data/videos/006f6538-a418-4b2f-87ba-1e7dbaa00652.mov
 data/videos/9184b36b-7bed-49cc-b41f-9164110b7bb6.mov
+
+# Runtime/editor data. Keep downloaded packs, generated graphics, resumable
+# chunks, local secrets and user uploads out of deploys and commits.
+data/reference-assets/
+data/library/
+data/uploads_tmp/
+data/broll/
+data/klipped-db.json
+data/.master-key
+*.uploading
+*.part

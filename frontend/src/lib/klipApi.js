@@ -1,6 +1,6 @@
 import axios from "axios";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || window.location.origin).replace(/\/$/, "");
 export const API = `${BACKEND_URL}/api`;
 
 const api = axios.create({ baseURL: API, timeout: 60000 });
@@ -20,6 +20,31 @@ const MAX_CHUNK_RETRIES = 4;
 // Storage key so a page reload lets user retry same file without re-uploading chunks
 const RESUME_KEY = (file) => `klippd_resume_${file.name}_${file.size}_${file.lastModified}`;
 
+const readResumeId = (key) => {
+    try { return window.localStorage.getItem(key); }
+    catch { return null; }
+};
+
+const writeResumeId = (key, value) => {
+    try { window.localStorage.setItem(key, value); }
+    catch { /* Upload still works when storage is blocked. */ }
+};
+
+const clearResumeId = (key) => {
+    try { window.localStorage.removeItem(key); }
+    catch { /* Nothing else to clean up. */ }
+};
+
+export const apiErrorMessage = (error, fallback = "Something went wrong") => {
+    const detail = error?.response?.data?.detail;
+    if (typeof detail === "string" && detail.trim()) return detail;
+    if (error?.code === "ECONNABORTED") return "The server took too long to respond. Try again.";
+    if (!error?.response && error?.message === "Network Error") {
+        return "Cannot reach the Klipped Studio server. Check the backend URL and try again.";
+    }
+    return error?.message || fallback;
+};
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function uploadChunkWithRetry(uploadId, index, blob, onChunkProgress) {
@@ -29,7 +54,6 @@ async function uploadChunkWithRetry(uploadId, index, blob, onChunkProgress) {
             const fd = new FormData();
             fd.append("file", blob, `chunk_${index}`);
             await api.post(`/uploads/chunk/${uploadId}?index=${index}`, fd, {
-                headers: { "Content-Type": "multipart/form-data" },
                 timeout: 0,
                 onUploadProgress: onChunkProgress,
             });
@@ -55,7 +79,7 @@ export const uploadVideo = async (file, onProgress) => {
     const resumeKey = RESUME_KEY(file);
     let upload_id = null;
     let received = new Set();
-    const cached = localStorage.getItem(resumeKey);
+    const cached = readResumeId(resumeKey);
     if (cached) {
         try {
             const { data: st } = await api.get(`/uploads/status/${cached}`);
@@ -65,7 +89,7 @@ export const uploadVideo = async (file, onProgress) => {
             }
         } catch {
             // Session expired/gone — fall through to fresh init
-            localStorage.removeItem(resumeKey);
+            clearResumeId(resumeKey);
         }
     }
 
@@ -77,13 +101,15 @@ export const uploadVideo = async (file, onProgress) => {
             total_chunks,
         });
         upload_id = init.upload_id;
-        localStorage.setItem(resumeKey, upload_id);
+        writeResumeId(resumeKey, upload_id);
     }
 
     // Upload each chunk not yet received
-    let uploadedBytes = received.size * CHUNK_SIZE;
-    // Clamp for uneven last chunk
-    uploadedBytes = Math.min(uploadedBytes, file.size);
+    let uploadedBytes = [...received].reduce((total, index) => {
+        if (!Number.isInteger(index) || index < 0 || index >= total_chunks) return total;
+        const start = index * CHUNK_SIZE;
+        return total + Math.max(0, Math.min(CHUNK_SIZE, file.size - start));
+    }, 0);
     if (onProgress) onProgress(Math.min(99, Math.round((uploadedBytes / file.size) * 100)));
 
     for (let i = 0; i < total_chunks; i++) {
@@ -108,7 +134,7 @@ export const uploadVideo = async (file, onProgress) => {
 
     // Finalize
     const { data: project } = await api.post(`/uploads/finalize/${upload_id}`);
-    localStorage.removeItem(resumeKey);
+    clearResumeId(resumeKey);
     if (onProgress) onProgress(100);
     return project;
 };
@@ -122,7 +148,6 @@ export const uploadCustomBroll = (pid, file, onProgress) => {
     fd.append("file", file);
     return api
         .post(`/projects/${pid}/broll_upload`, fd, {
-            headers: { "Content-Type": "multipart/form-data" },
             timeout: 0,
             onUploadProgress: (evt) => {
                 if (onProgress && evt.total)

@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: klipped-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: CORS_ORIGINS
+        value: https://klippedstudio.com,https://www.klippedstudio.com
+      - key: EDITING_PROFILE
+        value: minecraft_narrative
+      - key: SEED_GROQ_KEY
+        sync: false
+      - key: SEED_CEREBRAS_KEY
+        sync: false
+      - key: SEED_PIXABAY_KEY
+        sync: false

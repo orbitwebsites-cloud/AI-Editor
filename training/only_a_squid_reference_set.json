@@ -1,0 +1,13 @@
+{
+  "purpose": "Public metadata references for Minecraft narrative-edit analysis. Do not copy footage or use it for model fine-tuning without permission.",
+  "creator": "Only_A_Squid",
+  "channel": "https://www.youtube.com/@OnlyASquid",
+  "references": [
+    {"id": "Y14HQg8Tpu8", "title": "I Became A Mace God", "url": "https://www.youtube.com/watch?v=Y14HQg8Tpu8"},
+    {"id": "Yy0lqGg9wQk", "title": "Why I Destroyed My Minecraft Server", "url": "https://www.youtube.com/watch?v=Yy0lqGg9wQk"},
+    {"id": "GC6XCbQlSUw", "title": "How I Completely Ruined Our Minecraft Server", "url": "https://www.youtube.com/watch?v=GC6XCbQlSUw"},
+    {"id": "Ug0iUhkgQ2A", "title": "I Made Diamond Stronger Than Netherite", "url": "https://www.youtube.com/watch?v=Ug0iUhkgQ2A"},
+    {"id": "XpXM9LGE1j8", "title": "This Potion Grants You Immortality", "url": "https://www.youtube.com/watch?v=XpXM9LGE1j8"},
+    {"id": "FmYNzREfnCk", "title": "I Created The Deadliest Team", "url": "https://www.youtube.com/watch?v=FmYNzREfnCk"}
+  ]
+}

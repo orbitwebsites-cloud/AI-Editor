@@ -1,0 +1,217 @@
+{
+  "schema_version": "klippd.editing_knowledge.v1",
+  "description": "Original editing rules for retrieval-augmented planning. These are principles, not copied timelines or creator presets.",
+  "provenance_policy": {
+    "allowed": [
+      "user-owned media",
+      "licensed library assets",
+      "public metadata used as a research pointer",
+      "original editorial graphics whose generated nature is recorded"
+    ],
+    "disallowed": [
+      "claiming public videos were used for model fine-tuning without permission",
+      "fabricated gameplay, screenshots, quotes, results, people, or evidence",
+      "copying a creator's exact edit sequence or identity"
+    ]
+  },
+  "profiles": {
+    "minecraft_narrative": {
+      "aliases": ["minecraft", "smp", "lifesteal", "survival", "pvp", "mace", "netherite"],
+      "goal": "Make changing game state and player stakes immediately legible.",
+      "default_arc": ["hook", "setup", "escalation", "setback", "reveal", "payoff"]
+    },
+    "gaming": {
+      "aliases": ["gaming", "gameplay", "ranked", "speedrun", "boss", "match"],
+      "goal": "Keep action readable while using reactions and proof to reinforce the spoken story.",
+      "default_arc": ["hook", "setup", "escalation", "payoff"]
+    },
+    "talking_head": {
+      "aliases": ["talking head", "podcast", "interview", "tutorial", "explainer", "camera"],
+      "goal": "Preserve natural delivery while removing drag and visualizing only the ideas that benefit from proof or clarification.",
+      "default_arc": ["hook", "setup", "reveal", "payoff", "cta"]
+    },
+    "general": {
+      "aliases": [],
+      "goal": "Prioritize clarity, emotional contrast, continuity, and honest sourcing.",
+      "default_arc": ["hook", "setup", "payoff"]
+    }
+  },
+  "rules": [
+    {
+      "id": "story-hook-stakes",
+      "tags": ["story", "hook", "all"],
+      "rule": "Open on the clearest stake, contradiction, threat, or outcome the source actually supports.",
+      "rationale": "A specific unanswered question gives the viewer a reason to continue.",
+      "guardrail": "Do not promise an outcome absent from the transcript or footage.",
+      "weight": 10
+    },
+    {
+      "id": "story-state-change",
+      "tags": ["story", "minecraft_narrative", "gaming"],
+      "rule": "Place visual changes on state changes: new goal, player, place, resource, danger, setback, or result.",
+      "rationale": "Cuts become meaningful when they track what changed.",
+      "guardrail": "Do not cut merely because a fixed number of seconds elapsed.",
+      "weight": 10
+    },
+    {
+      "id": "story-cause-effect",
+      "tags": ["story", "all"],
+      "rule": "Preserve cause before consequence unless a deliberate cold-open reveal is later contextualized.",
+      "rationale": "Viewers should understand why the next event matters.",
+      "guardrail": "Avoid chronology changes that make claims misleading.",
+      "weight": 9
+    },
+    {
+      "id": "story-payoff-space",
+      "tags": ["story", "payoff", "all"],
+      "rule": "Give the payoff a readable shot and a short reaction window; do not bury it under another effect.",
+      "rationale": "Contrast and breathing room make the resolution land.",
+      "guardrail": "Do not manufacture a reaction or extend it deceptively.",
+      "weight": 8
+    },
+    {
+      "id": "cut-remove-drag",
+      "tags": ["pacing", "talking_head", "all"],
+      "rule": "Remove true filler, abandoned starts, dead air, and redundant clauses while preserving meaning and human cadence.",
+      "rationale": "Compression should increase information density without sounding robotic.",
+      "guardrail": "Words such as like, so, right, and okay are not fillers when semantically necessary.",
+      "weight": 8
+    },
+    {
+      "id": "cut-breath-boundary",
+      "tags": ["pacing", "audio", "talking_head"],
+      "rule": "Prefer sentence, clause, breath, or action boundaries for cuts; use short audio fades at discontinuities.",
+      "rationale": "Invisible audio continuity matters more than aggressive visual cutting.",
+      "guardrail": "Never clip consonants or remove every natural pause.",
+      "weight": 7
+    },
+    {
+      "id": "visual-proof-first",
+      "tags": ["broll", "evidence", "all"],
+      "rule": "When the speaker makes a concrete claim, prefer owned or licensed visual proof over decorative stock.",
+      "rationale": "Evidence increases comprehension and trust.",
+      "guardrail": "If proof is unavailable, use a neutral editorial label rather than a fake screenshot.",
+      "weight": 10
+    },
+    {
+      "id": "visual-intent",
+      "tags": ["broll", "all"],
+      "rule": "Every B-roll request must state what the viewer should understand or feel, not only a search keyword.",
+      "rationale": "Intent enables better retrieval and prevents unrelated filler imagery.",
+      "guardrail": "Reject visuals that are topically similar but contradict the sentence.",
+      "weight": 9
+    },
+    {
+      "id": "minecraft-native-proof",
+      "tags": ["broll", "minecraft_narrative"],
+      "rule": "Prefer inventory, item, map, location, player, health, crafting, combat, or before-after proof tied to the current state.",
+      "rationale": "Game-native evidence keeps narrative mechanics understandable.",
+      "guardrail": "Never generate gameplay-looking evidence for an event that was not captured.",
+      "weight": 10
+    },
+    {
+      "id": "minecraft-hud-safety",
+      "tags": ["captions", "minecraft_narrative", "gaming"],
+      "rule": "Keep captions and labels clear of health, hotbar, crosshair, inventory, chat, and other essential HUD regions.",
+      "rationale": "The viewer must be able to read both the edit and game state.",
+      "guardrail": "Move or shorten text instead of covering critical HUD information.",
+      "weight": 8
+    },
+    {
+      "id": "caption-phrase",
+      "tags": ["captions", "all"],
+      "rule": "Caption short meaning-complete phrases and highlight at most one or two consequential words.",
+      "rationale": "Phrase-level captions are readable and direct attention.",
+      "guardrail": "Do not turn every word into a competing animation.",
+      "weight": 8
+    },
+    {
+      "id": "caption-editorial-luxury",
+      "tags": ["captions", "talking_head", "luxury"],
+      "rule": "For an editorial luxury look, use restrained white type, a single warm highlight color, generous spacing, and a subtle entrance.",
+      "rationale": "Hierarchy and restraint read as premium more reliably than constant motion.",
+      "guardrail": "Maintain contrast and mobile readability; style cannot obscure meaning.",
+      "weight": 6
+    },
+    {
+      "id": "transition-default-cut",
+      "tags": ["transitions", "all"],
+      "rule": "Use a hard cut by default; earn stylized transitions through a real connection or major beat change.",
+      "rationale": "Unmotivated transitions slow pacing and advertise the edit.",
+      "guardrail": "Limit whips, glitches, and pushes when they do not preserve direction or meaning.",
+      "weight": 8
+    },
+    {
+      "id": "transition-match",
+      "tags": ["transitions", "minecraft_narrative", "gaming"],
+      "rule": "Use match cuts on shared motion, composition, item, location, or cause-effect relationships.",
+      "rationale": "A visual match can compress time while retaining orientation.",
+      "guardrail": "Do not label an arbitrary dissolve as a match cut.",
+      "weight": 7
+    },
+    {
+      "id": "audio-contrast",
+      "tags": ["audio", "all"],
+      "rule": "Use silence, music withdrawal, risers, and impacts to shape contrast around major beats, not every cut.",
+      "rationale": "Sparse cues retain impact and guide emotion.",
+      "guardrail": "Dialogue intelligibility always wins; avoid repetitive or misleading impact sounds.",
+      "weight": 8
+    },
+    {
+      "id": "audio-cue-purpose",
+      "tags": ["audio", "all"],
+      "rule": "Each audio cue must identify its narrative purpose: anticipation, transition, reveal, impact, or relief.",
+      "rationale": "Purpose-based sound design is easier to review and less noisy.",
+      "guardrail": "Do not add an effect only because one exists in the asset pack.",
+      "weight": 7
+    },
+    {
+      "id": "asset-retrieval-order",
+      "tags": ["assets", "all"],
+      "rule": "Search in this order: exact owned asset, semantically matched owned asset, licensed library, honest original editorial graphic.",
+      "rationale": "The closest trustworthy source usually makes the strongest edit.",
+      "guardrail": "A generated graphic is not evidence and must retain generated provenance.",
+      "weight": 10
+    },
+    {
+      "id": "asset-generated-scope",
+      "tags": ["assets", "generated", "all"],
+      "rule": "Generate only explanatory editorial forms such as title cards, stat layouts, player labels, item callouts, quote treatments, diagrams, or abstract backgrounds.",
+      "rationale": "Original graphics can clarify a beat without impersonating unavailable footage.",
+      "guardrail": "Never generate fake gameplay, UI screenshots, logos, people, quotes, proof, or branded assets that imply authenticity.",
+      "weight": 10
+    },
+    {
+      "id": "asset-logo-rights",
+      "tags": ["assets", "logo", "all"],
+      "rule": "Use logos only when supplied by the user or clearly licensed; otherwise render the name as neutral text.",
+      "rationale": "A textual label can communicate identity without inventing brand artwork.",
+      "guardrail": "Do not redraw or hallucinate a third-party logo.",
+      "weight": 9
+    },
+    {
+      "id": "continuity-direction",
+      "tags": ["continuity", "gaming", "all"],
+      "rule": "Preserve screen direction, spatial orientation, and action continuity unless disorientation is intentional and brief.",
+      "rationale": "Orientation lets viewers follow fast edits without cognitive reset.",
+      "guardrail": "Use an establishing frame or label after large location jumps.",
+      "weight": 7
+    },
+    {
+      "id": "qa-density",
+      "tags": ["qa", "all"],
+      "rule": "Reject plans that stack caption emphasis, B-roll, zoom, transition, and SFX on the same ordinary word.",
+      "rationale": "Effect density should peak with narrative importance.",
+      "guardrail": "Ordinary connective speech should remain visually quiet.",
+      "weight": 9
+    },
+    {
+      "id": "qa-payoff",
+      "tags": ["qa", "story", "all"],
+      "rule": "A narrative plan with a hook must identify a supported reveal or payoff, or explicitly label the clip as an open loop.",
+      "rationale": "Unresolved promises damage retention and trust.",
+      "guardrail": "Do not invent a payoff to satisfy the rubric.",
+      "weight": 10
+    }
+  ]
+}

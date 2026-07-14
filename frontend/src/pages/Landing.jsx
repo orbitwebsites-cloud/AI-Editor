@@ -13,18 +13,21 @@ import {
     Sparkles,
     Volume2,
     KeyRound,
+    WifiOff,
+    RotateCcw,
 } from "lucide-react";
 import {
     listProjects,
     uploadVideo,
     deleteProject,
     analyzeProject,
+    apiErrorMessage,
 } from "@/lib/klipApi";
 
 const FEATURES = [
     { icon: Scissors, title: "Kill filler words", copy: "Um. Uh. Stutters. All gone." },
     { icon: Wand2, title: "Animated captions", copy: "Word-by-word, TikTok or YouTube styled." },
-    { icon: Film, title: "Auto B-roll", copy: "AI picks moments, fetches from Pexels." },
+    { icon: Film, title: "Auto B-roll", copy: "AI picks moments, finds stock clips or uses your own library." },
     { icon: Zap, title: "Zoom + SFX", copy: "Impact zooms on hooks, whoosh on cuts." },
 ];
 
@@ -42,16 +45,23 @@ const STATUS_LABELS = {
     error: "ERROR",
 };
 
-export default function Landing({ keysStatus, onOpenSettings }) {
+export default function Landing({ keysStatus, backendOnline, onOpenSettings }) {
     const navigate = useNavigate();
     const [projects, setProjects] = useState([]);
     const [uploading, setUploading] = useState(false);
     const [uploadProgress, setUploadProgress] = useState(0);
     const [dragOver, setDragOver] = useState(false);
+    const [uploadName, setUploadName] = useState("");
+    const [projectsError, setProjectsError] = useState(false);
     const inputRef = useRef();
 
     const refresh = useCallback(() => {
-        listProjects().then(setProjects).catch(console.error);
+        listProjects()
+            .then((items) => {
+                setProjects(items);
+                setProjectsError(false);
+            })
+            .catch(() => setProjectsError(true));
     }, []);
 
     useEffect(() => {
@@ -63,6 +73,10 @@ export default function Landing({ keysStatus, onOpenSettings }) {
 
     const handleFile = async (file) => {
         if (!file) return;
+        if (backendOnline === false) {
+            toast.error("The Klipped Studio server is offline. Try again once it is connected.");
+            return;
+        }
         if (!keysStatus.groq) {
             toast.error("Add your Groq API key first (top-right → Keys)");
             onOpenSettings?.();
@@ -75,27 +89,24 @@ export default function Landing({ keysStatus, onOpenSettings }) {
             return;
         }
         setUploading(true);
+        setUploadName(file.name);
         setUploadProgress(0);
         try {
             const proj = await uploadVideo(file, setUploadProgress);
             toast.success("Uploaded — kicking off analysis");
             // Auto-trigger analyze
-            try {
-                await analyzeProject(proj.id);
-            } catch (e) {
-                console.error("analyze trigger failed", e);
-            }
+            await analyzeProject(proj.id).catch((e) => {
+                toast.warning(`Uploaded, but analysis has not started: ${apiErrorMessage(e, "try again in the project")}`);
+            });
             refresh();
             navigate(`/project/${proj.id}`);
         } catch (e) {
-            const detail = e?.response?.data?.detail
-                || e?.message
-                || "Upload failed";
             console.error("upload error", e);
-            toast.error(`Upload failed: ${detail}`);
+            toast.error(apiErrorMessage(e, "Upload failed"));
         } finally {
             setUploading(false);
             setUploadProgress(0);
+            setUploadName("");
         }
     };
 
@@ -119,6 +130,12 @@ export default function Landing({ keysStatus, onOpenSettings }) {
 
     return (
         <div className="min-h-[calc(100vh-72px)]" data-testid="landing-page">
+            {backendOnline === false && (
+                <div className="mx-4 md:mx-16 mt-5 border border-[#ff3333]/40 bg-[#ff3333]/10 px-4 py-3 flex items-center gap-3 text-sm" role="alert">
+                    <WifiOff className="w-4 h-4 text-[#ff5a5a] flex-shrink-0" />
+                    <span className="text-white/80">The editing server is offline. You can browse projects, but uploads and renders need the backend connected.</span>
+                </div>
+            )}
             {/* Marquee band */}
             <div className="overflow-hidden border-b border-white/10 py-2">
                 <div className="marquee">
@@ -155,6 +172,11 @@ export default function Landing({ keysStatus, onOpenSettings }) {
                         onDragLeave={() => setDragOver(false)}
                         onDrop={onDrop}
                         onClick={() => !uploading && inputRef.current?.click()}
+                        onKeyDown={(e) => {
+                            if (!uploading && (e.key === "Enter" || e.key === " ")) inputRef.current?.click();
+                        }}
+                        role="button"
+                        tabIndex={0}
                         className={`mt-12 border-2 ${
                             dragOver ? "border-[#ccff00] bg-[#ccff00]/5" : "border-dashed border-white/25"
                         } p-12 md:p-16 cursor-pointer transition-colors ${
@@ -182,7 +204,7 @@ export default function Landing({ keysStatus, onOpenSettings }) {
                                     />
                                 </div>
                                 <div className="text-white/50 text-xs font-mono mt-4 tracking-widest">
-                                    STAY LOCKED IN
+                                    {uploadName} · SAFE TO RETRY IF YOUR CONNECTION DROPS
                                 </div>
                             </div>
                         ) : (
@@ -253,6 +275,13 @@ export default function Landing({ keysStatus, onOpenSettings }) {
                     </div>
                 </div>
                 {projects.length === 0 ? (
+                    projectsError ? (
+                    <div className="panel p-12 text-center text-white/50" role="alert">
+                        <WifiOff className="w-10 h-10 mx-auto mb-3 text-[#ff5a5a]" />
+                        <div className="font-heading text-2xl tracking-wider text-white/80">COULDN'T LOAD PROJECTS</div>
+                        <button className="btn-ghost mt-4" onClick={refresh}><RotateCcw className="w-4 h-4" /> Try again</button>
+                    </div>
+                    ) : (
                     <div className="panel p-16 text-center text-white/40" data-testid="empty-projects">
                         <Film className="w-12 h-12 mx-auto mb-3 opacity-40" />
                         <div className="font-heading text-2xl tracking-wider text-white/60">
@@ -260,6 +289,7 @@ export default function Landing({ keysStatus, onOpenSettings }) {
                         </div>
                         <div className="text-sm mt-2">Drop your first clip above.</div>
                     </div>
+                    )
                 ) : (
                     <div
                         className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"

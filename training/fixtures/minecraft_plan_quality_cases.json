@@ -1,0 +1,58 @@
+{
+  "schema_version": "klippd.plan_quality_cases.v1",
+  "words": [
+    "If", "I", "lost", "one", "more", "heart", "I", "was", "banned", "from", "the", "server", "so", "I", "needed", "the", "mace", "before", "Danny", "found", "me", "first", "I", "searched", "the", "vault", "but", "the", "chest", "was", "empty", "then", "I", "heard", "footsteps", "behind", "me", "and", "found", "the", "mace", "we", "fought", "and", "I", "escaped", "with", "half", "a", "heart"
+  ],
+  "good_plan": {
+    "filler_indices": [],
+    "emphasis_indices": [2, 5, 8, 16, 18, 30, 34, 40, 45, 49],
+    "broll_moments": [
+      {"word_index": 5, "query": "minecraft low health", "reason": "Establish the risk", "visual_intent": "Show how close the player is to elimination"},
+      {"word_index": 16, "query": "minecraft mace item", "reason": "Identify the objective", "visual_intent": "Make the target item immediately recognizable"},
+      {"word_index": 30, "query": "empty minecraft chest", "reason": "Prove the setback", "visual_intent": "Confirm that the expected item is missing"},
+      {"word_index": 40, "query": "minecraft mace reveal", "reason": "Deliver the reveal", "visual_intent": "Show the real captured item discovery"},
+      {"word_index": 49, "query": "minecraft half heart", "reason": "Land the result", "visual_intent": "Show the narrow escape in the recorded HUD"}
+    ],
+    "story_beats": [
+      {"word_index": 0, "beat_type": "hook", "intent": "One more loss means a ban"},
+      {"word_index": 12, "beat_type": "setup", "intent": "The player needs the mace first"},
+      {"word_index": 22, "beat_type": "escalation", "intent": "The search begins"},
+      {"word_index": 30, "beat_type": "setback", "intent": "The chest is empty"},
+      {"word_index": 40, "beat_type": "reveal", "intent": "The mace is found"},
+      {"word_index": 45, "beat_type": "payoff", "intent": "The player escapes"}
+    ],
+    "transitions": [
+      {"word_index": 22, "type": "hard_cut", "reason": "Move from goal to search"},
+      {"word_index": 40, "type": "match_cut", "reason": "Match the spoken item to owned gameplay proof"}
+    ],
+    "audio_cues": [
+      {"word_index": 34, "type": "silence", "reason": "Create space for the approaching threat"},
+      {"word_index": 40, "type": "impact", "reason": "Support the real item reveal"}
+    ],
+    "asset_requests": [
+      {"word_index": 16, "kind": "item_callout", "text": "THE MACE", "subtext": "Find it before Danny", "accent": "gold", "reason": "Clarify the objective with an editorial label", "provenance": "generated_editorial_graphic", "is_evidence": false}
+    ]
+  },
+  "unsafe_plan": {
+    "filler_indices": [12, 999],
+    "emphasis_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+    "broll_moments": [
+      {"word_index": 16, "query": "mace", "reason": "looks cool", "visual_intent": ""}
+    ],
+    "story_beats": [
+      {"word_index": 40, "beat_type": "hook", "intent": "Start late"},
+      {"word_index": 12, "beat_type": "setup", "intent": "Move backward"}
+    ],
+    "transitions": [
+      {"word_index": 16, "type": "whip", "reason": "effect"},
+      {"word_index": 16, "type": "whip", "reason": "duplicate"}
+    ],
+    "audio_cues": [
+      {"word_index": 16, "type": "impact", "reason": "effect"}
+    ],
+    "asset_requests": [
+      {"word_index": 16, "kind": "item_callout", "text": "OFFICIAL PROOF", "subtext": "fake gameplay footage screenshot", "accent": "red", "reason": "evidence of the win"},
+      {"word_index": 30, "kind": "title_card", "text": "EMPTY", "subtext": "", "accent": "white", "reason": "not anchored to a visual moment"}
+    ]
+  }
+}

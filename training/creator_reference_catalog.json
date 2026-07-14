@@ -1,0 +1,37 @@
+{
+  "schema_version": "klippd.creator_references.v1",
+  "policy": "Public links and titles are research pointers only. They are not training examples, downloaded footage, or permission to imitate a creator's identity.",
+  "references": [
+    {
+      "creator": "Only_A_Squid",
+      "status": "identified",
+      "channel_url": "https://www.youtube.com/@OnlyASquid",
+      "niche": ["minecraft", "narrative", "gaming"],
+      "research_questions": [
+        "How quickly is the central stake stated?",
+        "Which game-state changes receive visual proof?",
+        "Where does pacing slow before a reveal or payoff?",
+        "How are player, item, and location changes kept legible?"
+      ],
+      "video_ids": ["Y14HQg8Tpu8", "Yy0lqGg9wQk", "GC6XCbQlSUw", "Ug0iUhkgQ2A", "XpXM9LGE1j8", "FmYNzREfnCk"]
+    },
+    {
+      "creator": "Danny",
+      "status": "needs_exact_channel",
+      "niche": ["minecraft", "gaming"],
+      "research_questions": ["Resolve the exact creator/channel before attaching any observations or links."],
+      "video_ids": []
+    },
+    {
+      "creator": "Lifesteal SMP ecosystem",
+      "status": "category_only",
+      "niche": ["minecraft", "smp", "narrative", "gaming"],
+      "research_questions": [
+        "How are alliances, betrayals, resources, deaths, and location changes introduced?",
+        "What proof makes complex multiplayer stakes understandable to a new viewer?",
+        "How does the edit distinguish setup, escalation, setback, reveal, and payoff?"
+      ],
+      "video_ids": []
+    }
+  ]
+}

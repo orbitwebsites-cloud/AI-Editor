@@ -1,7 +1,7 @@
 """FFmpeg-based video processing pipeline.
 - Extract audio
 - Cut filler segments
-- Burn animated ASS captions (TikTok or YouTube style)
+- Burn animated ASS captions (TikTok, YouTube, or Luxury style)
 - Overlay B-roll clips
 - Add SFX on cuts
 """
@@ -103,7 +103,12 @@ def aspect_target_size(aspect: str, src_w: int, src_h: int) -> tuple:
         return (1080, 1080)
     # default 16:9 — keep close to source, capped at 1920
     if src_w >= src_h * 16 / 9:
-        return (min(src_w, 1920), min(int(src_w * 9 / 16), 1080))
+        # H.264/yuv420p requires even dimensions. Phone captures and cropped
+        # exports can report odd widths, which otherwise makes FFmpeg fail at
+        # the end of an apparently successful upload.
+        width = max(2, min(src_w, 1920))
+        height = max(2, min(int(width * 9 / 16), 1080))
+        return (width - width % 2, height - height % 2)
     return (1920, 1080)
 
 
@@ -150,6 +155,19 @@ def generate_ass(words: List[Dict], out_path: str, style: str,
         emphasis_color = "&H005000FF"  # TikTok pink #FF0050 in ASS BGR
         outline_w = 5
         margin_v = int(res_h * 0.20)
+        alignment = 2
+        bold = -1
+    elif style == "luxury":
+        # Editorial white captions with restrained gold keyword emphasis.
+        # DejaVu Serif ships with the production Linux image, unlike most
+        # commercial display fonts, so this treatment renders consistently.
+        font = "DejaVu Serif"
+        size = int(res_h * 0.050)
+        primary = "&H00FFFFFF"
+        outline = "&H00101010"
+        emphasis_color = "&H0037AFD4"  # #D4AF37 gold in ASS BGR
+        outline_w = 2
+        margin_v = int(res_h * 0.16)
         alignment = 2
         bold = -1
     else:  # youtube clean
@@ -206,9 +224,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if re_ - rs < 0.12:
             re_ = rs + 0.12
         style_name = "Emph" if i in emphasis_set else "Default"
-        effect = r"{\fad(60,60)\t(0,80,\fscx115\fscy115)\t(80,160,\fscx100\fscy100)}"
-        if i in emphasis_set:
-            effect = r"{\fad(40,60)\t(0,100,\fscx140\fscy140)\t(100,220,\fscx110\fscy110)}"
+        if style == "luxury":
+            # Short upward slide, then settle. Emphasized keywords land larger.
+            y = int(res_h * 0.84)
+            start_scale = 128 if i in emphasis_set else 112
+            effect = rf"{{\an2\move({res_w // 2},{y + 42},{res_w // 2},{y},0,180)\fad(50,90)\fscx{start_scale}\fscy{start_scale}\t(0,180,\fscx100\fscy100)}}"
+        else:
+            effect = r"{\fad(60,60)\t(0,80,\fscx115\fscy115)\t(80,160,\fscx100\fscy100)}"
+            if i in emphasis_set:
+                effect = r"{\fad(40,60)\t(0,100,\fscx140\fscy140)\t(100,220,\fscx110\fscy110)}"
         lines.append(f"Dialogue: 0,{_fmt_time(rs)},{_fmt_time(re_)},{style_name},,0,0,0,,{effect}{txt}")
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -269,15 +293,24 @@ def cut_and_concat(input_path: str, keep_segments: List[Dict], output_path: str,
 # ---------- FULL RENDER ----------
 def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float],
                  broll_events: List[Dict], sfx_dir: str, output_path: str) -> None:
+    base_meta = probe_video(cut_video)
+    canvas_w = max(2, int(base_meta.get("width") or 1920))
+    canvas_h = max(2, int(base_meta.get("height") or 1080))
     inputs = ["-i", cut_video]
     input_idx = 1
 
     broll_input_map = []
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".svg"}
     for b in broll_events:
         local = b.get("local_path")
         if not local or not os.path.exists(local):
             continue
-        inputs += ["-i", local]
+        # Still images and logo files need a looped input so they can be used
+        # as timed overlays in the same way as a video B-roll clip.
+        if os.path.splitext(local)[1].lower() in image_extensions:
+            inputs += ["-loop", "1", "-t", str(b.get("out_duration", 3.5)), "-i", local]
+        else:
+            inputs += ["-i", local]
         broll_input_map.append((input_idx, b))
         input_idx += 1
 
@@ -296,11 +329,22 @@ def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float
         start = b.get("out_start", 0)
         duration = b.get("out_duration", 3.5)
         end = start + duration
+        fit = b.get("fit", "cover")
+        if fit == "full":
+            prepare = f"scale={canvas_w}:{canvas_h}"
+            position = "x=0:y=0"
+        elif fit == "pip":
+            prepare = "scale=iw*0.35:-2"
+            position = "x=W-w-30:y=30"
+        else:
+            prepare = (
+                f"scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase,"
+                f"crop={canvas_w}:{canvas_h}"
+            )
+            position = "x=0:y=0"
+        filters.append(f"[{idx}:v]{prepare},setpts=PTS-STARTPTS+{start}/TB[br{i}]")
         filters.append(
-            f"[{idx}:v]scale=iw*0.35:-2,setpts=PTS-STARTPTS+{start}/TB[br{i}]"
-        )
-        filters.append(
-            f"{cur}[br{i}]overlay=x=W-w-30:y=30:enable='between(t,{start},{end})'[vo{i}]"
+            f"{cur}[br{i}]overlay={position}:eof_action=pass:enable='between(t,{start},{end})'[vo{i}]"
         )
         cur = f"[vo{i}]"
 
@@ -353,16 +397,27 @@ def render_final(cut_video: str, ass_file: Optional[str], sfx_events: List[float
     run_ff(cmd)
 
 
-async def download_broll(url: str, dest_path: str) -> bool:
+async def download_broll(url: str, dest_path: str, max_bytes: int = 500 * 1024 * 1024) -> bool:
     import httpx
     try:
         async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
             async with c.stream("GET", url) as r:
                 r.raise_for_status()
+                declared = int(r.headers.get("content-length") or 0)
+                if declared > max_bytes:
+                    raise RuntimeError("B-roll download exceeds size limit")
+                total = 0
                 with open(dest_path, "wb") as f:
                     async for chunk in r.aiter_bytes(1024 * 256):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise RuntimeError("B-roll download exceeds size limit")
                         f.write(chunk)
         return os.path.getsize(dest_path) > 1024
     except Exception as e:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
         logger.warning(f"Broll download failed {url}: {e}")
         return False

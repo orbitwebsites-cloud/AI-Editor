@@ -1,7 +1,7 @@
 """AI service integrations with fallback logic.
 - Groq (primary) + Cerebras (fallback) for text tasks
 - Groq Whisper for transcription
-- Pexels for stock B-roll search
+- Pixabay for stock B-roll search
 """
 import json
 import logging
@@ -9,6 +9,13 @@ import re
 import httpx
 from openai import AsyncOpenAI
 from typing import List, Dict, Any, Optional
+from editing_profiles import profile_prompt
+from editing_intelligence import (
+    build_revision_prompt,
+    context_as_prompt,
+    quality_gate_edit_plan,
+    retrieve_editing_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +124,104 @@ def _extract_json(text: str) -> Any:
 
 
 # ---------- ANALYSIS ----------
-async def analyze_transcript(words: List[Dict], keys: dict) -> Dict[str, Any]:
-    """Ask LLM to identify filler segments, emphasis words, and B-roll opportunities."""
+def _normalize_edit_plan(parsed: Any, max_words: int) -> Dict[str, Any]:
+    """Convert an untrusted model response into the bounded runtime schema."""
+    parsed = parsed if isinstance(parsed, dict) else {}
+
+    def clean_timed(items, allowed_type=None, limit=12):
+        cleaned = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("word_index", 0))
+            except (TypeError, ValueError):
+                continue
+            if index < 0 or index >= max_words:
+                continue
+            row = {"word_index": index}
+            if allowed_type:
+                value = str(item.get(allowed_type[0], ""))
+                if value not in allowed_type[1]:
+                    continue
+                row[allowed_type[0]] = value
+            row["reason" if "reason" in item else "intent"] = str(
+                item.get("reason", item.get("intent", "")))[:200]
+            cleaned.append(row)
+        return cleaned[:limit]
+
+    broll = []
+    for moment in parsed.get("broll_moments", []):
+        if not isinstance(moment, dict):
+            continue
+        try:
+            index = int(moment.get("word_index", 0))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < max_words:
+            broll.append({
+                "word_index": index,
+                "query": str(moment.get("query", ""))[:80],
+                "reason": str(moment.get("reason", ""))[:200],
+                "visual_intent": str(moment.get("visual_intent", ""))[:240],
+            })
+
+    asset_requests = []
+    allowed_kinds = {"title_card", "stat_card", "player_label", "item_callout", "quote_card"}
+    allowed_accents = {"gold", "lime", "red", "cyan", "purple", "white"}
+    for item in parsed.get("asset_requests", []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("word_index", 0))
+        except (TypeError, ValueError):
+            continue
+        kind = str(item.get("kind", ""))
+        if not 0 <= index < max_words or kind not in allowed_kinds:
+            continue
+        accent = str(item.get("accent", "lime")).lower()
+        asset_requests.append({
+            "word_index": index,
+            "kind": kind,
+            "text": str(item.get("text", ""))[:48],
+            "subtext": str(item.get("subtext", ""))[:90],
+            "accent": accent if accent in allowed_accents else "lime",
+            "reason": str(item.get("reason", ""))[:180],
+        })
+
+    def clean_indices(key: str) -> List[int]:
+        values = parsed.get(key, []) if isinstance(parsed.get(key), list) else []
+        return [
+            int(value) for value in values
+            if isinstance(value, (int, str)) and str(value).lstrip("-").isdigit()
+        ]
+
+    return {
+        "filler_indices": clean_indices("filler_indices"),
+        "emphasis_indices": clean_indices("emphasis_indices"),
+        "broll_moments": broll[:8],
+        "story_beats": clean_timed(parsed.get("story_beats", []), ("beat_type", {"hook", "setup", "escalation", "setback", "reveal", "payoff", "cta"})),
+        "transitions": clean_timed(parsed.get("transitions", []), ("type", {"hard_cut", "match_cut", "push", "whip", "dip"})),
+        "audio_cues": clean_timed(parsed.get("audio_cues", []), ("type", {"impact", "whoosh", "riser", "silence", "glitch"})),
+        "asset_requests": asset_requests[:5],
+        "pacing_summary": str(parsed.get("pacing_summary", ""))[:400],
+        "title": str(parsed.get("title", "Untitled Clip"))[:120],
+        "summary": str(parsed.get("summary", ""))[:400],
+    }
+
+
+def _quality_rank(plan: Dict[str, Any]) -> tuple[int, int, int]:
+    review = plan.get("quality_review", {})
+    issues = review.get("remaining_issues", []) if isinstance(review, dict) else []
+    critical = sum(
+        1 for issue in issues
+        if isinstance(issue, dict) and issue.get("severity") == "critical"
+    )
+    return (int(bool(review.get("passed"))), -critical, int(review.get("score", 0)))
+
+
+async def analyze_transcript(words: List[Dict], keys: dict, profile: str | None = None) -> Dict[str, Any]:
+    """Build a complete, transcript-grounded editing blueprint."""
     max_words = min(len(words), 1200)
     lines = []
     for i, w in enumerate(words[:max_words]):
@@ -132,6 +235,9 @@ async def analyze_transcript(words: List[Dict], keys: dict) -> Dict[str, Any]:
         "You are an expert video editor AI. You analyze podcast/vlog transcripts to "
         "produce editing decisions. You reply ONLY with valid JSON, no prose."
     )
+    profile_rules = profile_prompt(profile)
+    retrieved_context = retrieve_editing_context(words[:max_words], profile)
+    knowledge_rules = context_as_prompt(retrieved_context)
 
     prompt = f"""Analyze this transcript. Each token is formatted `index:word`.
 
@@ -143,8 +249,21 @@ Return a JSON object with these keys (use word indices from the transcript):
   "filler_indices": [array of word indices that should be CUT - fillers like 'um','uh','ah','like','you know','so','basically','literally','right','okay' when used as fillers, stutters (repeated words), false-starts],
   "emphasis_indices": [array of word indices that should be visually emphasized (zoom-in/pop) - key words in punchlines, strong statements, hooks],
   "broll_moments": [
-    {{"word_index": <int>, "query": "<2-4 word Pexels search query>", "reason": "<brief>"}}
+    {{"word_index": <int>, "query": "<2-4 word visual search query>", "reason": "<brief>", "visual_intent": "<what the viewer should understand or feel>"}}
   ],
+  "story_beats": [
+    {{"word_index": <int>, "beat_type": "hook|setup|escalation|setback|reveal|payoff|cta", "intent": "<brief>"}}
+  ],
+  "transitions": [
+    {{"word_index": <int>, "type": "hard_cut|match_cut|push|whip|dip", "reason": "<brief>"}}
+  ],
+  "audio_cues": [
+    {{"word_index": <int>, "type": "impact|whoosh|riser|silence|glitch", "reason": "<brief>"}}
+  ],
+  "asset_requests": [
+    {{"word_index": <int>, "kind": "title_card|stat_card|player_label|item_callout|quote_card", "text": "<max 48 chars>", "subtext": "<max 90 chars>", "accent": "gold|lime|red|cyan|purple|white", "reason": "<why a graphic is better than unrelated footage>"}}
+  ],
+  "pacing_summary": "<one sentence describing rhythm and where it changes>",
   "title": "<catchy 3-8 word title for this clip>",
   "summary": "<1-sentence summary>"
 }}
@@ -152,73 +271,82 @@ Return a JSON object with these keys (use word indices from the transcript):
 Rules:
 - Be strict on fillers - only flag actual fillers, not meaningful words.
 - Emphasis: 5-15 words max, spread evenly.
-- B-roll: 3-8 moments max, pick concrete visual concepts only.
+- First understand the story: hook, setup, escalation, setback/reveal and payoff.
+- Every cut, transition, visual and sound cue must support comprehension, emotion, rhythm or continuity.
+- Prefer hard cuts. Use stylized transitions only when they connect two ideas or mark a real beat change.
+- Use silence before a reveal/impact when it improves contrast; do not add SFX to every cut.
+- B-roll: 3-8 moments max. State the visual intent, not just a keyword.
+- Asset requests: 0-5. Request an honest editorial graphic only when library/stock footage is unlikely to explain the moment well.
+- Asset-request word indices should match a B-roll moment so the graphic appears as a candidate there.
+- Never fabricate gameplay, results, screenshots, people, quotes or evidence.
 - Return ONLY the JSON. No markdown. No commentary.
+{profile_rules}
+{knowledge_rules}
 """
     raw = await call_text_llm(prompt, keys, system=system, want_json=True)
     parsed = _extract_json(raw)
+    first_plan = quality_gate_edit_plan(
+        _normalize_edit_plan(parsed, max_words),
+        words[:max_words],
+        requested_profile=retrieved_context["profile"],
+    )
+    candidates = [(1, first_plan)]
+    attempt_count = 1
+    first_review = first_plan.get("quality_review", {})
+    remaining = first_review.get("remaining_issues", [])
+    has_critical = any(
+        isinstance(issue, dict) and issue.get("severity") == "critical"
+        for issue in remaining
+    )
 
-    return {
-        "filler_indices": [int(i) for i in parsed.get("filler_indices", []) if isinstance(i, (int, str)) and str(i).lstrip("-").isdigit()],
-        "emphasis_indices": [int(i) for i in parsed.get("emphasis_indices", []) if isinstance(i, (int, str)) and str(i).lstrip("-").isdigit()],
-        "broll_moments": [
-            {
-                "word_index": int(m.get("word_index", 0)),
-                "query": str(m.get("query", ""))[:80],
-                "reason": str(m.get("reason", ""))[:200],
-            }
-            for m in parsed.get("broll_moments", []) if isinstance(m, dict)
-        ],
-        "title": str(parsed.get("title", "Untitled Clip"))[:120],
-        "summary": str(parsed.get("summary", ""))[:400],
-    }
+    # One bounded semantic retry. It is intentionally skipped for a passing
+    # plan, and any failed/unsafe retry loses to the safer first candidate.
+    if not first_review.get("passed") or has_critical:
+        revision_prompt = build_revision_prompt(
+            first_plan,
+            {"issues": remaining},
+            context=retrieved_context,
+            numbered_transcript=numbered,
+        )
+        try:
+            attempt_count = 2
+            revised_raw = await call_text_llm(
+                revision_prompt,
+                keys,
+                system=system,
+                want_json=True,
+            )
+            revised_plan = quality_gate_edit_plan(
+                _normalize_edit_plan(_extract_json(revised_raw), max_words),
+                words[:max_words],
+                requested_profile=retrieved_context["profile"],
+            )
+            candidates.append((2, revised_plan))
+        except Exception as exc:
+            logger.warning("Semantic edit-plan revision failed; keeping first safe plan: %s", exc)
 
-
-# ---------- PEXELS ----------
-async def search_pexels_video(query: str, pexels_key: str, per_page: int = 6,
-                              orientation: str = "landscape") -> List[Dict]:
-    """Search Pexels for stock video clips. Prefers 1080p+ files."""
-    if not pexels_key:
-        return []
-    headers = {"Authorization": pexels_key}
-    url = "https://api.pexels.com/videos/search"
-    params = {"query": query, "per_page": per_page, "orientation": orientation, "size": "medium"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, headers=headers, params=params)
-        if r.status_code != 200:
-            logger.warning(f"Pexels error {r.status_code}: {r.text[:200]}")
-            return []
-        data = r.json()
-    results = []
-    for v in data.get("videos", []):
-        files = sorted(v.get("video_files", []), key=lambda f: f.get("width", 0), reverse=True)
-        picked = None
-        # Prefer 1080p-1440p mp4
-        for f in files:
-            w = f.get("width", 0)
-            if 1080 <= w <= 1920 and f.get("file_type") == "video/mp4":
-                picked = f
-                break
-        if not picked:
-            for f in files:
-                if f.get("width", 0) >= 720 and f.get("file_type") == "video/mp4":
-                    picked = f
-                    break
-        if not picked and files:
-            picked = files[len(files) // 2]
-        if not picked:
-            continue
-        results.append({
-            "id": f"px_{v.get('id')}",
-            "provider": "pexels",
-            "duration": v.get("duration"),
-            "thumbnail": v.get("image"),
-            "video_url": picked.get("link"),
-            "width": picked.get("width"),
-            "height": picked.get("height"),
-            "user": (v.get("user") or {}).get("name", ""),
-        })
-    return results
+    selected_attempt, selected = max(candidates, key=lambda candidate: _quality_rank(candidate[1]))
+    candidate_scores = [
+        {
+            "attempt": number,
+            "score": int(plan.get("quality_review", {}).get("score", 0)),
+            "passed": bool(plan.get("quality_review", {}).get("passed")),
+            "critical_count": sum(
+                1 for issue in plan.get("quality_review", {}).get("remaining_issues", [])
+                if isinstance(issue, dict) and issue.get("severity") == "critical"
+            ),
+        }
+        for number, plan in candidates
+    ]
+    selected_review = selected.setdefault("quality_review", {})
+    selected_review.update({
+        "llm_attempt_count": attempt_count,
+        "revision_attempted": attempt_count == 2,
+        "selected_attempt": selected_attempt,
+        "candidate_scores": candidate_scores,
+        "final_score": int(selected_review.get("score", 0)),
+    })
+    return selected
 
 
 # ---------- PIXABAY (higher-quality free alternative) ----------
@@ -378,23 +506,6 @@ async def test_cerebras(api_key: str) -> Dict[str, Any]:
             max_tokens=5,
         )
         return {"ok": True, "model": r.model}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
-
-
-async def test_pexels(api_key: str) -> Dict[str, Any]:
-    if not api_key:
-        return {"ok": False, "error": "No key"}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                "https://api.pexels.com/videos/search",
-                headers={"Authorization": api_key},
-                params={"query": "city", "per_page": 1},
-            )
-        if r.status_code == 200:
-            return {"ok": True}
-        return {"ok": False, "error": f"HTTP {r.status_code}"}
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}
 

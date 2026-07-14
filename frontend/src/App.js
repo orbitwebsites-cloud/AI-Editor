@@ -11,21 +11,27 @@ import "@/App.css";
 function App() {
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [keysStatus, setKeysStatus] = useState({
-        groq: false, cerebras: false, pexels: false,
+        groq: false, cerebras: false, pixabay: false,
     });
+    const [backendOnline, setBackendOnline] = useState(null);
 
     const refreshKeys = () => {
-        getKeysStatus().then(setKeysStatus).catch(() => {});
+        getKeysStatus()
+            .then((status) => {
+                setKeysStatus(status);
+                setBackendOnline(true);
+            })
+            .catch(() => setBackendOnline(false));
     };
 
     useEffect(() => { refreshKeys(); }, []);
 
     return (
         <BrowserRouter>
-            <TopBar keysStatus={keysStatus} onOpenSettings={() => setSettingsOpen(true)} />
+            <TopBar keysStatus={keysStatus} backendOnline={backendOnline} onOpenSettings={() => setSettingsOpen(true)} />
             <Routes>
                 <Route path="/" element={
-                    <Landing keysStatus={keysStatus} onOpenSettings={() => setSettingsOpen(true)} />
+                    <Landing keysStatus={keysStatus} backendOnline={backendOnline} onOpenSettings={() => setSettingsOpen(true)} />
                 } />
                 <Route path="/project/:id" element={<Editor />} />
             </Routes>
