@@ -1,6 +1,6 @@
 # Klipped Studio
 
-An independent AI video editor at `klippedstudio.com`. It runs as a React frontend plus a FastAPI/FFmpeg backend. The MVP can use its built-in single-user file store; MongoDB is optional.
+An independent AI video editor at `klippdstudio.com`. It runs as a React frontend plus a FastAPI/FFmpeg backend. The MVP can use its built-in single-user file store; MongoDB is optional.
 
 ## Local setup
 
@@ -15,7 +15,7 @@ The Dockerfiles are production-ready: the backend image installs FFmpeg and incl
 docker build -f backend/Dockerfile -t klipped-backend .
 ```
 
-Set `REACT_APP_BACKEND_URL` to the public backend URL at build time, and set `CORS_ORIGINS=https://klippedstudio.com,https://www.klippedstudio.com` on the backend. For an ongoing paid deployment, mount a persistent volume at `/app/data`; it stores uploads, renders, the local single-user database, and its generated encryption key. MongoDB is optional.
+Set `REACT_APP_BACKEND_URL` to the public backend URL at build time, and set `CORS_ORIGINS=https://klippdstudio.com,https://www.klippdstudio.com` on the backend. For an ongoing paid deployment, mount a persistent volume at `/app/data`; it stores uploads, renders, the local single-user database, and its generated encryption key. MongoDB is optional.
 
 The MVP API is single-user and has no accounts. Do not expose it publicly without a gate. `APP_ACCESS_TOKEN` enables an optional request token, but a static frontend cannot keep that token secret; Cloudflare Access or equivalent edge authentication is the recommended temporary protection for tomorrow's private test. Groq is the only required provider key for transcription and analysis. Cerebras is an optional text fallback and Pixabay is optional stock search.
 

@@ -11,7 +11,7 @@ services:
     autoDeployTrigger: commit
     envVars:
       - key: CORS_ORIGINS
-        value: https://klippedstudio.com,https://www.klippedstudio.com
+        value: https://klippdstudio.com,https://www.klippdstudio.com
       - key: EDITING_PROFILE
         value: minecraft_narrative
       - key: SEED_GROQ_KEY
