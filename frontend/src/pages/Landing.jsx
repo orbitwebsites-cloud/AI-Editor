@@ -68,8 +68,10 @@ export default function Landing({ keysStatus, onOpenSettings }) {
             onOpenSettings?.();
             return;
         }
-        if (!file.type.startsWith("video/")) {
-            toast.error("That's not a video file.");
+        const validExt = /\.(mp4|mov|mkv|webm|m4v|avi|mpeg|mpg|qt)$/i;
+        const isVideo = (file.type && file.type.startsWith("video/")) || validExt.test(file.name);
+        if (!isVideo) {
+            toast.error(`Not a supported video: ${file.name}${file.type ? ` (${file.type})` : ""}`);
             return;
         }
         setUploading(true);
@@ -86,9 +88,11 @@ export default function Landing({ keysStatus, onOpenSettings }) {
             refresh();
             navigate(`/project/${proj.id}`);
         } catch (e) {
-            toast.error(
-                e?.response?.data?.detail || "Upload failed"
-            );
+            const detail = e?.response?.data?.detail
+                || e?.message
+                || "Upload failed";
+            console.error("upload error", e);
+            toast.error(`Upload failed: ${detail}`);
         } finally {
             setUploading(false);
             setUploadProgress(0);

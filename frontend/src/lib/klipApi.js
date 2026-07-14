@@ -28,6 +28,22 @@ export const analyzeProject = (id) =>
     api.post(`/projects/${id}/analyze`).then((r) => r.data);
 export const brollSearch = (pid, query) =>
     api.get(`/projects/${pid}/broll_search`, { params: { query } }).then((r) => r.data);
+export const uploadCustomBroll = (pid, file, onProgress) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return api
+        .post(`/projects/${pid}/broll_upload`, fd, {
+            headers: { "Content-Type": "multipart/form-data" },
+            timeout: 0,
+            onUploadProgress: (evt) => {
+                if (onProgress && evt.total)
+                    onProgress(Math.round((evt.loaded * 100) / evt.total));
+            },
+        })
+        .then((r) => r.data);
+};
+export const extractViralClips = (pid) =>
+    api.post(`/projects/${pid}/viral_clips`).then((r) => r.data);
 export const renderProject = (id, opts) =>
     api.post(`/projects/${id}/render`, opts).then((r) => r.data);
 
@@ -37,6 +53,11 @@ export const testKeys = () => api.post("/keys/test").then((r) => r.data);
 
 export const mediaOriginal = (id) => `${API}/media/original/${id}`;
 export const mediaOutput = (id) => `${API}/media/output/${id}`;
-export const downloadUrl = (id) => `${API}/projects/${id}/download`;
+export const mediaClip = (id, label) => `${API}/media/clip/${id}/${encodeURIComponent(label)}`;
+export const mediaThumbnail = () => null;
+export const downloadUrl = (id, clipLabel) =>
+    clipLabel
+        ? `${API}/projects/${id}/download?clip=${encodeURIComponent(clipLabel)}`
+        : `${API}/projects/${id}/download`;
 
 export default api;

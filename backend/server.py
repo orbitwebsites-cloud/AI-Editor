@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 import os
+import re
 import logging
 import uuid
 import shutil
@@ -126,14 +127,19 @@ class KeysBody(BaseModel):
 class RenderOptions(BaseModel):
     model_config = ConfigDict(extra="ignore")
     style: str = "tiktok"           # tiktok | youtube
+    aspect: str = "16:9"            # "16:9" | "9:16" | "1:1"
     remove_fillers: bool = True
     captions: bool = True
     sfx: bool = True
     zoom_ins: bool = True
     broll: bool = True
-    excluded_filler_indices: List[int] = Field(default_factory=list)  # user un-flagged fillers
-    added_filler_indices: List[int] = Field(default_factory=list)     # user added fillers
-    selected_broll: List[Dict[str, Any]] = Field(default_factory=list)  # [{moment_id, video_url}]
+    excluded_filler_indices: List[int] = Field(default_factory=list)
+    added_filler_indices: List[int] = Field(default_factory=list)
+    selected_broll: List[Dict[str, Any]] = Field(default_factory=list)
+    # If set, only render a slice of the source (viral-clip mode)
+    clip_start: Optional[float] = None
+    clip_end: Optional[float] = None
+    clip_label: Optional[str] = None  # used to name the output file
 
 
 # ---------- HELPERS ----------
@@ -191,7 +197,7 @@ async def upload_project(file: UploadFile = File(...)):
     pid = str(uuid.uuid4())
     ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
     ext = ext.lower()
-    if ext not in {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}:
+    if ext not in {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".mpeg", ".mpg", ".qt"}:
         raise HTTPException(400, f"Unsupported video type: {ext}")
     dst = DATA_DIR / "videos" / f"{pid}{ext}"
 
@@ -204,12 +210,16 @@ async def upload_project(file: UploadFile = File(...)):
             await out.write(chunk)
             total += len(chunk)
 
+    if total == 0:
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, "Empty file uploaded")
+
     # Probe
     try:
         meta = vp.probe_video(str(dst))
     except Exception as e:
         dst.unlink(missing_ok=True)
-        raise HTTPException(400, f"Invalid video file: {e}")
+        raise HTTPException(400, f"Could not read video file ({ext}): {str(e)[:200]}")
 
     project = {
         "id": pid,
@@ -317,6 +327,66 @@ async def broll_search(pid: str, query: str, per_page: int = 4):
     return {"query": query, "results": results}
 
 
+@api.post("/projects/{pid}/broll_upload")
+async def broll_upload(pid: str, file: UploadFile = File(...)):
+    """Accept a user-uploaded B-roll clip; return a Pexels-shaped result object."""
+    await get_project(pid)  # validate exists
+    ext = os.path.splitext(file.filename or "clip.mp4")[1].lower() or ".mp4"
+    if ext not in {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}:
+        raise HTTPException(400, f"Unsupported B-roll type: {ext}")
+    clip_id = f"user_{uuid.uuid4().hex[:8]}"
+    dst = DATA_DIR / "broll" / f"{pid}_{clip_id}{ext}"
+
+    total = 0
+    async with aiofiles.open(dst, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 512)
+            if not chunk:
+                break
+            await out.write(chunk)
+            total += len(chunk)
+    if total == 0:
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, "Empty file uploaded")
+
+    try:
+        meta = vp.probe_video(str(dst))
+    except Exception as e:
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, f"Could not read B-roll: {str(e)[:200]}")
+
+    # Return Pexels-compatible shape; video_url is our own media path
+    backend_base = os.environ.get("PUBLIC_BACKEND_URL", "").rstrip("/")
+    video_url = f"file://{dst}"  # Backend can read local file:// directly
+    return {
+        "id": clip_id,
+        "duration": meta.get("duration", 0),
+        "thumbnail": None,
+        "video_url": video_url,
+        "local_path": str(dst),
+        "width": meta.get("width", 0),
+        "height": meta.get("height", 0),
+        "user": "You",
+        "is_custom": True,
+    }
+
+
+# ---------- VIRAL CLIPS ----------
+@api.post("/projects/{pid}/viral_clips")
+async def viral_clips(pid: str):
+    """Ask LLM to find the 3-5 best viral-worthy short clip moments in this project."""
+    proj = await get_project(pid)
+    transcript = proj.get("transcript") or {}
+    words = transcript.get("words", [])
+    if not words:
+        raise HTTPException(400, "Project not analyzed yet")
+    keys = await get_keys()
+    duration = float(proj.get("duration", 0))
+    clips = await ai.extract_viral_clips(words, keys, duration)
+    await update_project(pid, viral_clips=clips)
+    return {"clips": clips}
+
+
 # ---------- RENDER PIPELINE ----------
 async def _run_render(pid: str, opts: RenderOptions):
     try:
@@ -328,8 +398,11 @@ async def _run_render(pid: str, opts: RenderOptions):
         words = transcript.get("words", [])
         analysis = proj.get("analysis") or {}
         duration = float(proj.get("duration", 0))
-        w = int(proj.get("width") or 1920) or 1920
-        h = int(proj.get("height") or 1080) or 1080
+        src_w = int(proj.get("width") or 1920) or 1920
+        src_h = int(proj.get("height") or 1080) or 1080
+
+        # Determine output canvas from aspect
+        out_w, out_h = vp.aspect_target_size(opts.aspect, src_w, src_h)
 
         # Reconcile filler indices
         auto_fillers = set(analysis.get("filler_indices", []))
@@ -337,12 +410,26 @@ async def _run_render(pid: str, opts: RenderOptions):
         auto_fillers |= set(opts.added_filler_indices)
         filler_indices = list(auto_fillers) if opts.remove_fillers else []
 
-        # Compute keep segments
+        # Compute keep segments (may be trimmed to viral clip window below)
         keep = vp.build_keep_segments(words, filler_indices, duration)
-        await update_project(pid, progress=15, status_message="Cutting filler segments...")
+
+        # If viral-clip mode: restrict keep to [clip_start, clip_end] range
+        clip_start = opts.clip_start
+        clip_end = opts.clip_end
+        if clip_start is not None and clip_end is not None:
+            trimmed = []
+            for seg in keep:
+                s = max(seg["start"], clip_start)
+                e = min(seg["end"], clip_end)
+                if e - s > 0.08:
+                    trimmed.append({"start": s, "end": e})
+            keep = trimmed or [{"start": clip_start, "end": clip_end}]
+
+        await update_project(pid, progress=15, status_message="Cutting segments...")
 
         cut_path = str(DATA_DIR / "output" / f"{pid}_cut.mp4")
-        await asyncio.to_thread(vp.cut_and_concat, proj["original_path"], keep, cut_path, w, h)
+        await asyncio.to_thread(vp.cut_and_concat, proj["original_path"], keep, cut_path,
+                                out_w, out_h, src_w, src_h, None, None)
         await update_project(pid, progress=45, status_message="Generating animated captions...")
 
         # Build ASS captions
@@ -350,7 +437,7 @@ async def _run_render(pid: str, opts: RenderOptions):
         if opts.captions and words:
             ass_path = str(DATA_DIR / "subtitles" / f"{pid}.ass")
             emphasis_set = set(analysis.get("emphasis_indices", [])) if opts.zoom_ins else set()
-            await asyncio.to_thread(vp.generate_ass, words, ass_path, opts.style, w, h,
+            await asyncio.to_thread(vp.generate_ass, words, ass_path, opts.style, out_w, out_h,
                                     emphasis_set, keep)
 
         # SFX events (whoosh at each cut boundary in output timeline)
@@ -366,14 +453,20 @@ async def _run_render(pid: str, opts: RenderOptions):
         if opts.broll and opts.selected_broll:
             await update_project(pid, progress=55, status_message="Downloading B-roll clips...")
             for i, sel in enumerate(opts.selected_broll):
-                url = sel.get("video_url")
+                url = sel.get("video_url") or ""
                 moment_word_idx = int(sel.get("word_index", 0))
                 if not url:
                     continue
-                local = str(DATA_DIR / "broll" / f"{pid}_broll_{i}.mp4")
-                ok = await vp.download_broll(url, local)
-                if not ok:
-                    continue
+                # Handle custom (already-local) vs Pexels (needs download)
+                if url.startswith("file://") or sel.get("is_custom"):
+                    local = sel.get("local_path") or url.replace("file://", "")
+                    if not os.path.exists(local):
+                        continue
+                else:
+                    local = str(DATA_DIR / "broll" / f"{pid}_broll_{i}.mp4")
+                    ok = await vp.download_broll(url, local)
+                    if not ok:
+                        continue
                 # Compute output time from word index remap
                 if moment_word_idx < len(words):
                     orig_t = float(words[moment_word_idx].get("start", 0))
@@ -400,8 +493,16 @@ async def _run_render(pid: str, opts: RenderOptions):
                 })
 
         await update_project(pid, progress=70, status_message="Rendering final video...")
-        output_path = str(DATA_DIR / "output" / f"{pid}_final.mp4")
-        vp.render_final(cut_path, ass_path, sfx_events, broll_events, SFX_DIR, output_path)
+
+        # Choose output filename — separate for viral clips so main render is preserved
+        if opts.clip_label:
+            safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", opts.clip_label)[:40]
+            output_path = str(DATA_DIR / "output" / f"{pid}_clip_{safe_label}.mp4")
+        else:
+            output_path = str(DATA_DIR / "output" / f"{pid}_final.mp4")
+
+        await asyncio.to_thread(vp.render_final, cut_path, ass_path, sfx_events,
+                                broll_events, SFX_DIR, output_path)
 
         # Cleanup intermediate
         try:
@@ -409,9 +510,18 @@ async def _run_render(pid: str, opts: RenderOptions):
         except Exception:
             pass
 
-        await update_project(pid, status="done", progress=100,
-                             status_message="Render complete!",
-                             output_path=output_path)
+        update_fields = {"status": "done", "progress": 100,
+                         "status_message": "Render complete!"}
+        if opts.clip_label:
+            # Track in viral_renders dict on project
+            proj_now = await get_project(pid)
+            vr = proj_now.get("viral_renders") or {}
+            vr[opts.clip_label] = output_path
+            update_fields["viral_renders"] = vr
+            update_fields["last_clip_label"] = opts.clip_label
+        else:
+            update_fields["output_path"] = output_path
+        await update_project(pid, **update_fields)
     except Exception as e:
         logger.exception("Render failed")
         await update_project(pid, status="error", status_message=f"Render failed: {e}")
@@ -430,13 +540,29 @@ async def render(pid: str, opts: RenderOptions, bg: BackgroundTasks):
 
 # ---------- MEDIA ----------
 @api.get("/projects/{pid}/download")
-async def download_final(pid: str):
+async def download_final(pid: str, clip: Optional[str] = None):
+    """Download the main render, or a viral clip if ?clip=<label> is given."""
     proj = await get_project(pid)
-    out = proj.get("output_path")
+    if clip:
+        out = (proj.get("viral_renders") or {}).get(clip)
+        fname = f"{proj.get('name','video')}_{clip}.mp4"
+    else:
+        out = proj.get("output_path")
+        fname = f"{proj.get('name','video')}_edited.mp4"
     if not out or not os.path.exists(out):
         raise HTTPException(404, "Output not ready")
-    return FileResponse(out, media_type="video/mp4",
-                        filename=f"{proj.get('name','video')}_edited.mp4")
+    return FileResponse(out, media_type="video/mp4", filename=fname)
+
+
+@api.get("/media/clip/{pid}/{clip_label}")
+async def media_clip(pid: str, clip_label: str):
+    """Stream a specific viral clip output."""
+    proj = await get_project(pid)
+    vr = proj.get("viral_renders") or {}
+    out = vr.get(clip_label)
+    if not out or not os.path.exists(out):
+        raise HTTPException(404)
+    return FileResponse(out, media_type="video/mp4")
 
 
 @api.get("/media/original/{pid}")

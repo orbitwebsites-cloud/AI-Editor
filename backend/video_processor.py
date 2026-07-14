@@ -94,6 +94,34 @@ def build_keep_segments(words: List[Dict], filler_indices: List[int],
     return keep
 
 
+# ---------- ASPECT RATIO ----------
+def aspect_target_size(aspect: str, src_w: int, src_h: int) -> tuple:
+    """Return (out_w, out_h) target output canvas."""
+    if aspect == "9:16":
+        return (1080, 1920)
+    if aspect == "1:1":
+        return (1080, 1080)
+    # default 16:9 — keep close to source, capped at 1920
+    if src_w >= src_h * 16 / 9:
+        return (min(src_w, 1920), min(int(src_w * 9 / 16), 1080))
+    return (1920, 1080)
+
+
+def aspect_filter(src_w: int, src_h: int, out_w: int, out_h: int) -> str:
+    """Return an FFmpeg filter chain that fits src into out via center-crop + scale + pad."""
+    # First scale to cover, then crop center to exact aspect
+    src_ratio = src_w / max(src_h, 1)
+    out_ratio = out_w / max(out_h, 1)
+    if abs(src_ratio - out_ratio) < 0.02:
+        # Same aspect — just scale
+        return f"scale={out_w}:{out_h}"
+    if src_ratio > out_ratio:
+        # Source wider — scale to output height, crop width
+        return f"scale=-2:{out_h},crop={out_w}:{out_h}"
+    # Source taller — scale to output width, crop height
+    return f"scale={out_w}:-2,crop={out_w}:{out_h}"
+
+
 # ---------- ASS SUBTITLE GEN ----------
 def _fmt_time(sec: float) -> str:
     if sec < 0:
@@ -189,21 +217,33 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 # ---------- CONCAT (cut fillers) ----------
 def cut_and_concat(input_path: str, keep_segments: List[Dict], output_path: str,
-                   res_w: int = 1920, res_h: int = 1080) -> None:
-    if len(keep_segments) == 1:
-        seg = keep_segments[0]
-        full_dur = probe_video(input_path)["duration"]
-        if seg["start"] < 0.1 and abs(seg["end"] - full_dur) < 0.5:
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path]
-            run_ff(cmd)
-            return
+                   res_w: int = 1920, res_h: int = 1080,
+                   src_w: Optional[int] = None, src_h: Optional[int] = None,
+                   clip_start: Optional[float] = None, clip_end: Optional[float] = None) -> None:
+    """Cut input into keep_segments and concatenate to output.
+    If clip_start/clip_end given, first slice the source to that range, then apply cuts.
+    res_w/res_h = target output canvas (for aspect ratio changes).
+    src_w/src_h = source video dimensions (used to build aspect filter)."""
+    src_w = src_w or res_w
+    src_h = src_h or res_h
+    a_filter = aspect_filter(src_w, src_h, res_w, res_h)
+
+    # Adjust keep_segments if clip_start/end provided (slice into that window)
+    if clip_start is not None and clip_end is not None:
+        new_keep = []
+        for seg in keep_segments:
+            s = max(seg["start"], clip_start)
+            e = min(seg["end"], clip_end)
+            if e - s > 0.08:
+                new_keep.append({"start": s, "end": e})
+        keep_segments = new_keep or [{"start": clip_start, "end": clip_end}]
 
     filters = []
     parts_v = []
     parts_a = []
     for i, seg in enumerate(keep_segments):
         s, e = seg["start"], seg["end"]
-        filters.append(f"[0:v]trim=start={s}:end={e},setpts=PTS-STARTPTS[v{i}]")
+        filters.append(f"[0:v]trim=start={s}:end={e},setpts=PTS-STARTPTS,{a_filter}[v{i}]")
         filters.append(f"[0:a]atrim=start={s}:end={e},asetpts=PTS-STARTPTS[a{i}]")
         parts_v.append(f"[v{i}]")
         parts_a.append(f"[a{i}]")

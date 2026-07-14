@@ -1,60 +1,79 @@
-# KLIPPD — AI Video Editor
+# KLIPPD — AI Video Editor (PRD)
 
-## Original Problem Statement
+## Original problem statement
 > "how the hell do i edit my vids like they were edited by a 3k editor but i did it all for free bro"
 > "no i need ai to edit my whole ass video taking out all ums uh stuttering add amazing captions add broll efects sfx all that shi"
-> User choices: use Groq + Cerebras free-tier keys with fallback, best model per task, edits existing videos (not creates), keys pasted in-app later
+> "Add viral-clip extraction; Add 9:16 aspect-ratio export for shorts; User-uploaded B-roll (not just Pexels); im not able to upload a .mov file"
 
 ## Architecture
-- **Frontend**: React 19 + Tailwind, brutalist gen-z aesthetic (Anton + Outfit, #ccff00 over #050505)
-- **Backend**: FastAPI + Motor + FFmpeg subprocess pipeline
-- **AI (OpenAI-compatible SDKs, encrypted keys in Mongo)**:
-  - Groq primary: `whisper-large-v3-turbo` transcription, `llama-3.3-70b-versatile` reasoning
-  - Cerebras fallback: `llama-3.3-70b` / `qwen-3-32b`
-  - Pexels: B-roll stock video
-- **Video pipeline**: extract audio → cut fillers (trim+concat) → burn ASS captions (TikTok/YouTube) → overlay B-roll → whoosh SFX at cuts → zoom pulses on emphasis
-- **Storage**: MongoDB (projects, encrypted keys); disk at `/app/data/`
+- **Backend**: FastAPI + MongoDB + FFmpeg 5.1.9
+  - Groq Whisper (`whisper-large-v3-turbo`) for transcription with word-level timestamps
+  - LLM fallback chain: Groq `llama-3.3-70b-versatile` → Groq `llama-3.1-8b-instant` → Cerebras `gpt-oss-120b` → Cerebras `zai-glm-4.7`
+  - Pexels API for stock B-roll videos
+  - Fernet-encrypted API keys stored in MongoDB (seeded from `SEED_*_KEY` env vars)
+  - FFmpeg subprocess pipeline (async via `asyncio.to_thread`) for cut/concat, ASS subtitle burn-in, B-roll overlay, SFX mixing
+  - Supervisor hook (`ensure_ffmpeg`) auto-reinstalls FFmpeg if container is reset
+- **Frontend**: React 19 + Tailwind
+  - Brutalist streetwear aesthetic (Anton + Outfit fonts, neon #CCFF00 brand)
 
-## Core Features (P0) — All Implemented
-- ✅ Upload video (drag & drop)
-- ✅ Whisper transcription + word timestamps
-- ✅ LLM filler + emphasis + B-roll suggestions with Groq→Cerebras fallback
-- ✅ Interactive transcript, click-to-seek, toggle filler/emphasis per word
-- ✅ Style picker: TikTok vs YouTube captions
-- ✅ Pexels B-roll picker (fetch per suggested moment, choose from grid)
-- ✅ Zoom pulses, whoosh SFX toggles
-- ✅ Final MP4 render + download
-- ✅ Fernet-encrypted API key vault + connection test
-- ✅ Gen-Z brutalist UI (Anton, neon, marquee, grain)
+## User personas
+- Gen-Z creators / TikTok / YouTube Shorts editors (primary) — want $3K editor output for $0
+- Podcasters / vloggers doing long-form content
 
-## Implemented (Jan 14, 2026)
-- Backend: `server.py`, `ai_services.py`, `video_processor.py` — full pipeline verified end-to-end
-- Frontend: Landing, Editor, Settings modal, TopBar with live key status pills
-- FFmpeg pipeline: filler-cut, ASS caption burn-in, B-roll overlay, SFX mix, zoom pulses
-- Backend keys pre-seeded for testing (Groq/Cerebras/Pexels — all pass connection test)
+## Core requirements
+- All AI runs on user's free-tier keys with automatic fallback
+- Auto detect fillers, emphasis, B-roll moments in a single LLM pass
+- User can manually toggle any word as filler (click) or jump to it (dbl-click)
+- Feature toggles per render: cut fillers, captions, SFX, zoom, B-roll
+- Two caption styles: TikTok (Impact + pink pop) vs YouTube (Arial + yellow)
+- Three aspect ratios: 16:9, 9:16, 1:1
+- Downloadable final MP4 + independent viral-clip MP4s
 
-## Prioritized Backlog
+## What's been implemented
+
+### Iteration 1 (2026-07-14) — MVP
+- Video upload → audio extract → Whisper transcription → LLM analysis (fillers/emphasis/B-roll/title) → render pipeline (cut fillers, animated captions, SFX, B-roll overlay) → download
+- Full 4-model LLM fallback (Groq→Cerebras)
+- Interactive transcript editor with click-to-toggle-filler + karaoke sync
+- Style picker (TikTok/YouTube), feature toggles per render
+- Fernet-encrypted API key storage + live connection test
+- Brutalist landing page, settings modal, editor page
+- Passed 11/11 backend tests + all critical UI flows
+
+### Iteration 2 (2026-07-14) — Extended features
+- **Fixed .mov upload** — accepts files by extension when MIME type is empty/quicktime; improved error surfaces
+- **9:16 / 1:1 aspect ratio** — new `aspect` field in RenderOptions; FFmpeg center-crop + scale; ASS subtitle resolution auto-syncs
+- **Viral clip extraction** — new `POST /api/projects/{id}/viral_clips` LLM endpoint finds 3-5 punchiest 20-60s moments (hook/caption/score/reason); each rendered as its own 9:16 short (`viral_renders[label]`) — main render preserved separately
+- **Custom B-roll upload** — new `POST /api/projects/{id}/broll_upload` accepts video → returns Pexels-compatible object → auto-selected in UI with "YOURS" badge → render pipeline handles local `file://` paths without redownloading
+- **FFmpeg persistence** — supervisor pre-start hook ensures FFmpeg is always installed
+- Verified end-to-end: 9:16 render produces 1080×1920 output, custom B-roll upload returns metadata, viral clip endpoint responds < 1s
+
+## Backlog
+
+### P0 (blocking)
+- (none) — MVP + user's requested extensions all shipped
 
 ### P1
-- [ ] Thumbnail generation on upload (endpoint stubbed)
-- [ ] Long transcript chunking for LLM (>1200 words currently truncated)
-- [ ] Progress via WebSocket instead of polling
-- [ ] Vertical 9:16 export preset for shorts
+- Test with a real 10-30s speaking video (synthetic clips have no words for LLM to analyze)
+- Long-transcript chunking for LLM (currently truncated at 1200 words)
+- FFmpeg progress % parsing for smoother render bar
+- Thumbnail generation on upload
 
 ### P2
-- [ ] Multi-language transcription (currently English)
-- [ ] Custom caption theming (colors/fonts/position)
-- [ ] Timeline visualization for keep/cut segments
-- [ ] User accounts + project sharing
-- [ ] B-roll fade + Ken Burns
+- User accounts + project sharing (currently single-user MVP)
+- Multi-language transcription
+- Timeline visualization for keep/cut segments
+- Zoom-in Ken Burns on emphasis words (currently only caption emphasis)
+- Music/BGM library, auto beat-sync
 
 ### Future
-- [ ] AI voice-over dubbing
-- [ ] Auto highlight reel (best 60s from long-form)
-- [ ] Music beat-sync auto-cuts
+- AI voice-over dubbing
+- Cloud storage instead of local disk
+- Real-time collaborative editing
 
 ## Environment
-- FFmpeg 5.1.9 installed
+- FFmpeg 5.1.9 (`apt` package; auto-reinstalled via `ensure_ffmpeg` supervisor hook)
 - SFX at `/app/backend/assets/sfx/` (whoosh.wav, impact.wav)
-- Data dirs auto-created at `/app/data/{videos,audio,output,subtitles,broll}`
+- Data dirs at `/app/data/{videos,audio,output,subtitles,broll}`
 - `MASTER_ENCRYPTION_KEY` in `/app/backend/.env`
+- All 3 API keys (Groq/Cerebras/Pexels) seeded from `SEED_*_KEY` env vars

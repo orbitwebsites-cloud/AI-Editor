@@ -212,6 +212,86 @@ async def search_pexels_video(query: str, pexels_key: str, per_page: int = 4) ->
     return results
 
 
+# ---------- VIRAL CLIP EXTRACTION ----------
+async def extract_viral_clips(words: List[Dict], keys: dict, duration: float) -> List[Dict[str, Any]]:
+    """Ask LLM to find the 3-5 punchiest self-contained short-clip moments."""
+    if not words:
+        return []
+
+    max_words = min(len(words), 1500)
+    lines = []
+    for i, w in enumerate(words[:max_words]):
+        txt = (w.get("word") or "").strip()
+        if not txt:
+            continue
+        lines.append(f"{i}[{float(w.get('start',0)):.1f}s]:{txt}")
+    numbered = " ".join(lines)
+
+    system = (
+        "You are a viral short-form video expert (TikTok/Reels/Shorts). "
+        "You identify the most captivating, self-contained ~20-45 second moments "
+        "from a longer transcript. You reply ONLY with valid JSON."
+    )
+
+    prompt = f"""Analyze this transcript. Each token is `index[start_seconds]:word`.
+
+TRANSCRIPT:
+{numbered}
+
+Return JSON:
+{{
+  "clips": [
+    {{
+      "start_word_index": <int>,
+      "end_word_index": <int>,
+      "hook": "<the punchy opening line, max 12 words>",
+      "caption": "<viral-style caption with 2-3 emojis, max 100 chars>",
+      "score": <int 1-100, higher = more viral>,
+      "reason": "<why this works, max 20 words>"
+    }}
+  ]
+}}
+
+Rules:
+- 3 to 5 clips total, ranked best first.
+- Each clip should be 20-60 seconds long (based on word timestamps).
+- Prefer moments with strong hooks, controversy, humor, insight, or emotion.
+- Skip filler-heavy sections.
+- Return ONLY the JSON.
+"""
+    raw = await call_text_llm(prompt, keys, system=system, want_json=True)
+    parsed = _extract_json(raw)
+    clips_in = parsed.get("clips", []) if isinstance(parsed, dict) else []
+
+    results = []
+    for c in clips_in[:5]:
+        if not isinstance(c, dict):
+            continue
+        try:
+            si = int(c.get("start_word_index", 0))
+            ei = int(c.get("end_word_index", 0))
+            if si < 0 or ei <= si or si >= len(words) or ei >= len(words):
+                continue
+            start = float(words[si].get("start", 0))
+            end = float(words[ei].get("end", start + 30))
+            if end - start < 5 or end - start > 120:
+                continue
+            results.append({
+                "start_word_index": si,
+                "end_word_index": ei,
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "duration": round(end - start, 2),
+                "hook": str(c.get("hook", ""))[:200],
+                "caption": str(c.get("caption", ""))[:200],
+                "score": int(c.get("score", 50)),
+                "reason": str(c.get("reason", ""))[:300],
+            })
+        except (ValueError, TypeError):
+            continue
+    return results
+
+
 # ---------- CONNECTION TESTS ----------
 async def test_groq(api_key: str) -> Dict[str, Any]:
     if not api_key:

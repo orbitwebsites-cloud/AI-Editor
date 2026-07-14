@@ -13,14 +13,22 @@ import {
     RefreshCw,
     Search,
     Check,
+    Upload,
+    Flame,
+    Monitor,
+    Smartphone,
+    Square,
 } from "lucide-react";
 import {
     getProject,
     analyzeProject,
     brollSearch,
+    uploadCustomBroll,
+    extractViralClips,
     renderProject,
     mediaOriginal,
     mediaOutput,
+    mediaClip,
     downloadUrl,
 } from "@/lib/klipApi";
 
@@ -46,18 +54,25 @@ export default function Editor() {
     const navigate = useNavigate();
     const [project, setProject] = useState(null);
     const [style, setStyle] = useState("tiktok");
+    const [aspect, setAspect] = useState("16:9");
     const [renderOpts, setRenderOpts] = useState({
         remove_fillers: true, captions: true, sfx: true, zoom_ins: true, broll: true,
     });
     const [excludedFillers, setExcludedFillers] = useState(new Set());
     const [addedFillers, setAddedFillers] = useState(new Set());
     const [brollByMoment, setBrollByMoment] = useState({});
+    const [customBrollByMoment, setCustomBrollByMoment] = useState({});
+    const [uploadingBrollIdx, setUploadingBrollIdx] = useState(null);
     const [brollSelected, setBrollSelected] = useState({});
     const [searchingIdx, setSearchingIdx] = useState(null);
     const [renderStarting, setRenderStarting] = useState(false);
+    const [viralClips, setViralClips] = useState([]);
+    const [extractingClips, setExtractingClips] = useState(false);
+    const [renderingClipLabel, setRenderingClipLabel] = useState(null);
     const [currentTime, setCurrentTime] = useState(0);
     const videoRef = useRef();
     const transcriptRef = useRef();
+    const brollFileInputRef = useRef();
 
     const refresh = useCallback(async () => {
         try { setProject(await getProject(id)); }
@@ -85,6 +100,11 @@ export default function Editor() {
     const autoFillers = useMemo(() => new Set(analysis.filler_indices || []), [analysis.filler_indices]);
     const emphasisSet = useMemo(() => new Set(analysis.emphasis_indices || []), [analysis.emphasis_indices]);
     const brollMoments = analysis.broll_moments || [];
+
+    // Sync viral clips from server
+    useEffect(() => {
+        if (project?.viral_clips) setViralClips(project.viral_clips);
+    }, [project?.viral_clips]);
 
     const effectiveFillers = useMemo(() => {
         const s = new Set(autoFillers);
@@ -142,6 +162,68 @@ export default function Editor() {
         finally { setSearchingIdx(null); }
     };
 
+    const uploadCustomBrollForMoment = async (idx, file) => {
+        if (!file) return;
+        setUploadingBrollIdx(idx);
+        try {
+            const r = await uploadCustomBroll(id, file);
+            setCustomBrollByMoment((prev) => ({
+                ...prev,
+                [idx]: [...(prev[idx] || []), r],
+            }));
+            // Auto-select the uploaded clip
+            setBrollSelected((s) => ({ ...s, [idx]: r }));
+            toast.success("Custom B-roll uploaded");
+        } catch (e) {
+            toast.error(e?.response?.data?.detail || "B-roll upload failed");
+        } finally {
+            setUploadingBrollIdx(null);
+        }
+    };
+
+    const extractClips = async () => {
+        setExtractingClips(true);
+        try {
+            const r = await extractViralClips(id);
+            setViralClips(r.clips || []);
+            if (!r.clips?.length) toast.info("No viral moments found — try a longer clip");
+            else toast.success(`Found ${r.clips.length} viral moments`);
+        } catch (e) {
+            toast.error(e?.response?.data?.detail || "Failed to extract clips");
+        } finally {
+            setExtractingClips(false);
+        }
+    };
+
+    const renderViralClip = async (clip, idx) => {
+        const label = `clip_${idx + 1}_${Math.round(clip.start)}s`;
+        setRenderingClipLabel(label);
+        try {
+            const opts = {
+                style,
+                aspect: "9:16",  // Viral clips default to vertical
+                remove_fillers: renderOpts.remove_fillers,
+                captions: renderOpts.captions,
+                sfx: renderOpts.sfx,
+                zoom_ins: renderOpts.zoom_ins,
+                broll: false,     // Skip B-roll for viral clips (keeps it fast)
+                excluded_filler_indices: [...excludedFillers],
+                added_filler_indices: [...addedFillers],
+                selected_broll: [],
+                clip_start: clip.start,
+                clip_end: clip.end,
+                clip_label: label,
+            };
+            await renderProject(id, opts);
+            toast.success(`Rendering "${clip.hook.substring(0, 40)}…"`);
+            refresh();
+        } catch (e) {
+            toast.error(e?.response?.data?.detail || "Clip render failed");
+        } finally {
+            setRenderingClipLabel(null);
+        }
+    };
+
     const startRender = async () => {
         setRenderStarting(true);
         const selected_broll = Object.entries(brollSelected)
@@ -152,6 +234,7 @@ export default function Editor() {
             }));
         const opts = {
             style,
+            aspect,
             ...renderOpts,
             excluded_filler_indices: [...excludedFillers],
             added_filler_indices: [...addedFillers],
@@ -303,6 +386,33 @@ export default function Editor() {
                 {isReady && (
                 <aside className="space-y-6" data-testid="editor-sidebar">
                     <div className="panel p-6">
+                        <div className="font-mono text-xs text-white/40 tracking-widest mb-3">// ASPECT</div>
+                        <div className="grid grid-cols-3 gap-2">
+                            {[
+                                { val: "16:9", label: "16:9", Icon: Monitor, sub: "YouTube" },
+                                { val: "9:16", label: "9:16", Icon: Smartphone, sub: "TikTok" },
+                                { val: "1:1", label: "1:1", Icon: Square, sub: "Feed" },
+                            ].map(({ val, label, Icon, sub }) => (
+                                <button
+                                    key={val}
+                                    onClick={() => setAspect(val)}
+                                    data-testid={`aspect-${val.replace(":", "-")}`}
+                                    className="style-pill flex-col !py-3"
+                                    style={{
+                                        background: aspect === val ? "#CCFF00" : "transparent",
+                                        color: aspect === val ? "#000" : "rgba(255,255,255,0.6)",
+                                        borderColor: aspect === val ? "#CCFF00" : "rgba(255,255,255,0.1)",
+                                    }}
+                                >
+                                    <Icon className="w-4 h-4 mb-1" />
+                                    <span className="text-xs">{label}</span>
+                                    <span className="text-[9px] opacity-70 font-mono">{sub}</span>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    <div className="panel p-6">
                         <div className="font-mono text-xs text-white/40 tracking-widest mb-3">// STYLE</div>
                         <div className="grid grid-cols-2 gap-2">
                             <button
@@ -395,7 +505,10 @@ export default function Editor() {
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                         {brollMoments.map((m, idx) => {
                             const results = brollByMoment[idx] || [];
+                            const customs = customBrollByMoment[idx] || [];
+                            const combined = [...customs, ...results];
                             const selected = brollSelected[idx];
+                            const isUploading = uploadingBrollIdx === idx;
                             return (
                                 <div key={idx} className="panel p-5" data-testid={`broll-moment-${idx}`}>
                                     <div className="font-mono text-[10px] text-white/40 tracking-widest">
@@ -405,23 +518,47 @@ export default function Editor() {
                                         &quot;{(m.query || "").toUpperCase()}&quot;
                                     </div>
                                     <div className="text-white/50 text-xs mt-1">{m.reason}</div>
-                                    <button
-                                        onClick={() => searchBrollForMoment(idx, m.query)}
-                                        disabled={searchingIdx === idx}
-                                        className="btn-ghost mt-3 !text-xs !py-1.5"
-                                        data-testid={`broll-search-${idx}`}
-                                    >
-                                        {searchingIdx === idx ? (
-                                            <Loader2 className="w-3 h-3 animate-spin" />
-                                        ) : (
-                                            <Search className="w-3 h-3" />
-                                        )}
-                                        {results.length ? "Refresh" : "Search Pexels"}
-                                    </button>
-                                    {results.length > 0 && (
+                                    <div className="flex flex-wrap gap-2 mt-3">
+                                        <button
+                                            onClick={() => searchBrollForMoment(idx, m.query)}
+                                            disabled={searchingIdx === idx}
+                                            className="btn-ghost !text-xs !py-1.5"
+                                            data-testid={`broll-search-${idx}`}
+                                        >
+                                            {searchingIdx === idx ? (
+                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                            ) : (
+                                                <Search className="w-3 h-3" />
+                                            )}
+                                            {results.length ? "Refresh" : "Pexels"}
+                                        </button>
+                                        <label
+                                            className="btn-ghost !text-xs !py-1.5 cursor-pointer"
+                                            data-testid={`broll-upload-${idx}`}
+                                        >
+                                            {isUploading ? (
+                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                            ) : (
+                                                <Upload className="w-3 h-3" />
+                                            )}
+                                            Upload yours
+                                            <input
+                                                type="file"
+                                                accept="video/*,.mp4,.mov,.mkv,.webm"
+                                                className="hidden"
+                                                onChange={(e) => {
+                                                    const f = e.target.files?.[0];
+                                                    if (f) uploadCustomBrollForMoment(idx, f);
+                                                    e.target.value = "";
+                                                }}
+                                            />
+                                        </label>
+                                    </div>
+                                    {combined.length > 0 && (
                                         <div className="grid grid-cols-2 gap-2 mt-3">
-                                            {results.slice(0, 4).map((r) => {
+                                            {combined.slice(0, 6).map((r) => {
                                                 const active = selected?.id === r.id;
+                                                const isCustom = r.is_custom;
                                                 return (
                                                     <div
                                                         key={r.id}
@@ -437,11 +574,22 @@ export default function Editor() {
                                                         }
                                                         data-testid={`broll-clip-${idx}-${r.id}`}
                                                     >
-                                                        <img
-                                                            src={r.thumbnail}
-                                                            alt=""
-                                                            className="w-full h-20 object-cover"
-                                                        />
+                                                        {r.thumbnail ? (
+                                                            <img
+                                                                src={r.thumbnail}
+                                                                alt=""
+                                                                className="w-full h-20 object-cover"
+                                                            />
+                                                        ) : (
+                                                            <div className="w-full h-20 bg-[#111] flex items-center justify-center">
+                                                                <Film className="w-6 h-6 text-white/30" />
+                                                            </div>
+                                                        )}
+                                                        {isCustom && (
+                                                            <div className="absolute top-1 left-1 bg-[#CCFF00] text-black text-[9px] font-mono px-1.5">
+                                                                YOURS
+                                                            </div>
+                                                        )}
                                                         {active && (
                                                             <div className="absolute inset-0 bg-[#ccff00]/20 flex items-center justify-center">
                                                                 <Check className="w-6 h-6 text-[#ccff00]" strokeWidth={3} />
@@ -456,6 +604,109 @@ export default function Editor() {
                             );
                         })}
                     </div>
+                </section>
+            )}
+
+            {/* VIRAL CLIPS SECTION */}
+            {isReady && (
+                <section className="mt-12" data-testid="viral-section">
+                    <div className="flex items-end justify-between mb-6 flex-wrap gap-3">
+                        <div>
+                            <div className="font-mono text-xs text-white/40 tracking-widest mb-2">// AI HIGHLIGHT REEL</div>
+                            <div className="font-display text-3xl tracking-wider">VIRAL CLIPS</div>
+                            <div className="text-white/50 text-sm mt-1">
+                                AI finds the punchiest 20-60s moments and cuts them as 9:16 shorts
+                            </div>
+                        </div>
+                        <button
+                            onClick={extractClips}
+                            disabled={extractingClips}
+                            className="btn-brand"
+                            data-testid="extract-clips-btn"
+                        >
+                            {extractingClips ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                                <Flame className="w-4 h-4" />
+                            )}
+                            {viralClips.length ? "Re-extract" : "Find Viral Clips"}
+                        </button>
+                    </div>
+
+                    {viralClips.length > 0 && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                            {viralClips.map((c, idx) => {
+                                const label = `clip_${idx + 1}_${Math.round(c.start)}s`;
+                                const rendered = (project.viral_renders || {})[label];
+                                const isRendering = renderingClipLabel === label;
+                                return (
+                                    <div key={idx} className="panel p-5" data-testid={`viral-clip-${idx}`}>
+                                        <div className="flex items-start justify-between gap-2">
+                                            <div className="font-mono text-[10px] text-white/40 tracking-widest">
+                                                #{idx + 1} · {c.start}s → {c.end}s ({c.duration}s)
+                                            </div>
+                                            <div
+                                                className="font-mono text-xs px-1.5 py-0.5"
+                                                style={{
+                                                    background: c.score >= 80 ? "#CCFF00"
+                                                        : c.score >= 60 ? "rgba(204,255,0,0.3)"
+                                                        : "rgba(255,255,255,0.1)",
+                                                    color: c.score >= 80 ? "#000" : "#fff",
+                                                }}
+                                            >
+                                                {c.score}
+                                            </div>
+                                        </div>
+                                        <div className="font-display text-lg tracking-wider mt-2 leading-tight">
+                                            &quot;{c.hook}&quot;
+                                        </div>
+                                        <div className="text-white/70 text-sm mt-2">{c.caption}</div>
+                                        <div className="text-white/40 text-xs mt-1 italic">{c.reason}</div>
+
+                                        {rendered ? (
+                                            <div className="mt-4 space-y-2">
+                                                <video
+                                                    src={mediaClip(id, label)}
+                                                    controls
+                                                    className="w-full bg-black"
+                                                    style={{ aspectRatio: "9/16", maxHeight: 400 }}
+                                                    data-testid={`viral-video-${idx}`}
+                                                />
+                                                <a
+                                                    href={downloadUrl(id, label)}
+                                                    download
+                                                    className="btn-brand w-full !justify-center !text-xs !py-2"
+                                                    data-testid={`viral-download-${idx}`}
+                                                >
+                                                    <Download className="w-3 h-3" /> Download Short
+                                                </a>
+                                            </div>
+                                        ) : (
+                                            <button
+                                                onClick={() => renderViralClip(c, idx)}
+                                                disabled={isRendering}
+                                                className="btn-ghost w-full !justify-center mt-4"
+                                                data-testid={`viral-render-${idx}`}
+                                            >
+                                                {isRendering ? (
+                                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                                ) : (
+                                                    <Zap className="w-3 h-3" />
+                                                )}
+                                                Render as 9:16 Short
+                                            </button>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+
+                    {!viralClips.length && !extractingClips && (
+                        <div className="panel p-8 text-center text-white/40 font-mono text-sm">
+                            Click &quot;Find Viral Clips&quot; to have the AI extract the most punchy moments.
+                        </div>
+                    )}
                 </section>
             )}
         </div>
