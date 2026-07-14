@@ -9,45 +9,106 @@ export const listProjects = () => api.get("/projects").then((r) => r.data);
 export const getProject = (id) => api.get(`/projects/${id}`).then((r) => r.data);
 export const deleteProject = (id) => api.delete(`/projects/${id}`).then((r) => r.data);
 
-// Chunked upload: bypass ingress 413 by splitting file into small chunks.
-// Chunk size = 4MB (safely under any ingress limit).
+// Chunked upload with per-chunk retries + resume support.
+// - Chunk size: 4MB (safely under any ingress limit).
+// - Retries: each chunk up to 4 times with exponential backoff.
+// - Resume: previously-uploaded upload_id (from localStorage keyed by file identity)
+//   is checked via /uploads/status to skip already-received chunks.
 const CHUNK_SIZE = 4 * 1024 * 1024;
+const MAX_CHUNK_RETRIES = 4;
+
+// Storage key so a page reload lets user retry same file without re-uploading chunks
+const RESUME_KEY = (file) => `klippd_resume_${file.name}_${file.size}_${file.lastModified}`;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function uploadChunkWithRetry(uploadId, index, blob, onChunkProgress) {
+    let lastErr = null;
+    for (let attempt = 0; attempt < MAX_CHUNK_RETRIES; attempt++) {
+        try {
+            const fd = new FormData();
+            fd.append("file", blob, `chunk_${index}`);
+            await api.post(`/uploads/chunk/${uploadId}?index=${index}`, fd, {
+                headers: { "Content-Type": "multipart/form-data" },
+                timeout: 0,
+                onUploadProgress: onChunkProgress,
+            });
+            return;
+        } catch (e) {
+            lastErr = e;
+            const status = e?.response?.status;
+            // 404 (session gone) or 4xx client errors → do not retry
+            if (status === 404 || (status >= 400 && status < 500 && status !== 408 && status !== 429)) {
+                throw e;
+            }
+            const backoff = Math.min(8000, 500 * 2 ** attempt) + Math.random() * 400;
+            await sleep(backoff);
+        }
+    }
+    throw lastErr;
+}
 
 export const uploadVideo = async (file, onProgress) => {
     const total_chunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
-    // 1. init
-    const { data: init } = await api.post("/uploads/init", {
-        filename: file.name,
-        size: file.size,
-        total_chunks,
-    });
-    const upload_id = init.upload_id;
 
-    // 2. upload chunks sequentially
-    let uploaded = 0;
-    for (let i = 0; i < total_chunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(file.size, start + CHUNK_SIZE);
-        const chunk = file.slice(start, end);
-        const fd = new FormData();
-        fd.append("file", chunk, `chunk_${i}`);
-        await api.post(`/uploads/chunk/${upload_id}?index=${i}`, fd, {
-            headers: { "Content-Type": "multipart/form-data" },
-            timeout: 0,
-            onUploadProgress: (evt) => {
-                if (onProgress && file.size) {
-                    const currentChunkLoaded = evt.loaded || 0;
-                    const pct = Math.round(((uploaded + currentChunkLoaded) / file.size) * 100);
-                    onProgress(Math.min(99, pct));
-                }
-            },
-        });
-        uploaded += (end - start);
-        if (onProgress) onProgress(Math.min(99, Math.round((uploaded / file.size) * 100)));
+    // Try to resume an existing session for this exact file
+    const resumeKey = RESUME_KEY(file);
+    let upload_id = null;
+    let received = new Set();
+    const cached = localStorage.getItem(resumeKey);
+    if (cached) {
+        try {
+            const { data: st } = await api.get(`/uploads/status/${cached}`);
+            if (st?.total_chunks === total_chunks && st?.size === file.size) {
+                upload_id = cached;
+                received = new Set(st.received_chunks || []);
+            }
+        } catch {
+            // Session expired/gone — fall through to fresh init
+            localStorage.removeItem(resumeKey);
+        }
     }
 
-    // 3. finalize
+    // Fresh init if no resumable session
+    if (!upload_id) {
+        const { data: init } = await api.post("/uploads/init", {
+            filename: file.name,
+            size: file.size,
+            total_chunks,
+        });
+        upload_id = init.upload_id;
+        localStorage.setItem(resumeKey, upload_id);
+    }
+
+    // Upload each chunk not yet received
+    let uploadedBytes = received.size * CHUNK_SIZE;
+    // Clamp for uneven last chunk
+    uploadedBytes = Math.min(uploadedBytes, file.size);
+    if (onProgress) onProgress(Math.min(99, Math.round((uploadedBytes / file.size) * 100)));
+
+    for (let i = 0; i < total_chunks; i++) {
+        if (received.has(i)) continue;
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(file.size, start + CHUNK_SIZE);
+        const chunkSize = end - start;
+        const chunk = file.slice(start, end);
+
+        await uploadChunkWithRetry(upload_id, i, chunk, (evt) => {
+            if (onProgress && file.size) {
+                const currentChunkLoaded = evt.loaded || 0;
+                const pct = Math.round(((uploadedBytes + currentChunkLoaded) / file.size) * 100);
+                onProgress(Math.min(99, pct));
+            }
+        });
+
+        uploadedBytes += chunkSize;
+        received.add(i);
+        if (onProgress) onProgress(Math.min(99, Math.round((uploadedBytes / file.size) * 100)));
+    }
+
+    // Finalize
     const { data: project } = await api.post(`/uploads/finalize/${upload_id}`);
+    localStorage.removeItem(resumeKey);
     if (onProgress) onProgress(100);
     return project;
 };

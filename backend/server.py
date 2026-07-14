@@ -315,6 +315,23 @@ async def upload_chunk(upload_id: str, index: int, file: UploadFile = File(...))
     return {"ok": True, "received": len(m["received_chunks"]), "total": m["total_chunks"]}
 
 
+@api.get("/uploads/status/{upload_id}")
+async def upload_status(upload_id: str):
+    """Get upload session status — used for resume."""
+    manifest_path = UPLOAD_TMP / upload_id / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(404, "Upload session not found")
+    async with aiofiles.open(manifest_path, "r") as f:
+        m = json.loads(await f.read())
+    return {
+        "upload_id": upload_id,
+        "filename": m.get("filename"),
+        "size": m.get("size"),
+        "total_chunks": m.get("total_chunks"),
+        "received_chunks": sorted(m.get("received_chunks", [])),
+    }
+
+
 @api.post("/uploads/finalize/{upload_id}")
 async def upload_finalize(upload_id: str):
     session_dir = UPLOAD_TMP / upload_id
