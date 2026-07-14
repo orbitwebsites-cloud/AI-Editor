@@ -1,0 +1,120 @@
+{
+  "typography": {
+    "headings": {
+      "family": "Anton, sans-serif",
+      "weights": ["400"],
+      "usage": "Use for massive, high-impact titles, hero text, and project names. MUST use uppercase and tracking-wider for that aggressive streetwear/creator vibe. NO generic fonts like Inter."
+    },
+    "body": {
+      "family": "Outfit, sans-serif",
+      "weights": ["300", "400", "600"],
+      "usage": "Use for UI labels, transcript text, settings, and standard paragraph text. Clean, geometric, highly legible."
+    },
+    "mono": {
+      "family": "JetBrains Mono, monospace",
+      "weights": ["400"],
+      "usage": "Use for timestamp displays, API key inputs, and technical progress statuses."
+    }
+  },
+  "colors": {
+    "background": {
+      "base": "#050505",
+      "panel": "#111111",
+      "elevated": "#1A1A1A"
+    },
+    "primary": {
+      "brand": "#CCFF00",
+      "hover": "#B3E600",
+      "active": "#99CC00"
+    },
+    "accent": {
+      "destructive": "#FF3333",
+      "tiktok_pink": "#FF0050",
+      "youtube_red": "#FF0000",
+      "cyan": "#00FFFF"
+    },
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#A1A1AA",
+      "muted": "#52525B"
+    },
+    "border": {
+      "default": "rgba(255,255,255,0.1)",
+      "focus": "#CCFF00"
+    }
+  },
+  "visual_enhancers": {
+    "surfaces": [
+      "Grid Borders: Use strict 1px border-white/10 on panels to create a technical, 'editing bay' skeleton. No soft shadows. No transparent backgrounds over content.",
+      "Tracing Beam: Apply a neon gradient border to the active playing transcript segment or processing card to make it look alive.",
+      "Glassmorphism: Strictly reserved for floating overlays (like B-roll pickers or settings modal). Use backdrop-blur-2xl bg-black/60 with a 1px border-white/20."
+    ],
+    "textures": "Add a very subtle SVG noise/grain overlay (opacity 2-5%) over the entire app background to kill digital flatness and give it a raw 'music video' feel.",
+    "borders": "Sharp edges everywhere. Use rounded-none or max rounded-sm. Absolutely no pill-shaped buttons unless it's a specific 'TikTok' style toggle."
+  },
+  "component_guidelines": {
+    "buttons": "Brutalist. Solid #CCFF00 with black text for primary. Hover state: Translate X and Y by -2px with a hard #CCFF00 drop shadow (box-shadow: 2px 2px 0px #CCFF00).",
+    "transcription_editor": "The core tool. Text should be large (text-xl to text-2xl). 'Ums' and 'uhs' highlighted in destructive red or strikethrough. Active playing word gets a 'karaoke' glow.",
+    "b_roll_cards": "Bento-style grid. When hovering over a suggested B-roll clip, use a slight scale transform and play a preview if available.",
+    "progress_indicators": "Kinetic typography or ASCII art loaders. Example: massive outline text running in the background while video renders.",
+    "forms_and_inputs": "For API keys: pure brutalist inputs. bg-transparent, border-b-2 border-white/20, focus:border-brand. Monospace text.",
+    "toggles": "Physical-looking switches. When toggling between 'TikTok Aggressive' and 'YouTube Clean', the whole UI accent color could shift slightly (Pink/Cyan vs Solid Red)."
+  },
+  "grids_and_layouts": {
+    "app_layout": "Fullscreen dashboard layout. Left/Right sidebars (w-64 to w-80) for tools and project lists, fixed height. Center pane is the video preview and transcription timeline.",
+    "spacing": "Generous spacing. Use p-6, p-8 for panels. The bento grid for b-roll should use gap-6 or gap-8.",
+    "alignment": "Strict left alignment for settings and text. Center the video preview perfectly. Use bento grids for dashboard."
+  },
+  "motion_and_interactions": {
+    "hover_states": "Hard, aggressive transitions. Instead of soft fades, use snappy spring animations in framer-motion.",
+    "page_transitions": "Wipe effects or stark color flashes to mimic video cuts.",
+    "transcription_sync": "Smooth automatic scrolling of the transcription box as the video plays. The active word should scale up slightly (1.1x) and turn #CCFF00."
+  },
+  "accessibility": {
+    "contrast": "Text over backgrounds must meet APCA standards. Brand neon (#CCFF00) against black is excellent. Black text on brand neon is also excellent.",
+    "focus": "All interactive elements must have focus:ring-2 focus:ring-[#CCFF00] focus:ring-offset-2 focus:ring-offset-black.",
+    "test_ids": "All interactive and key informational elements MUST include a data-testid attribute in kebab-case."
+  },
+  "media_and_3d": {
+    "images": "Use high-energy, raw, streetwear, or cyberpunk aesthetic images for placeholders.",
+    "icons": "Use iconoir-react or lucide-react. Bold, technical strokes. No emoji.",
+    "3d_libraries": "If rendering an 'AI Processing' state, consider a lightweight particle canvas or kinetic marquee text to simulate intense computational effort."
+  },
+  "image_urls": [
+    {
+      "url": "https://images.unsplash.com/photo-1569135579442-d37b7a0ea74e?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMjV8MHwxfHNlYXJjaHwzfHxza2F0ZXIlMjBzdW5zZXQlMjBqdW1wfGVufDB8fHx8MTc4Mzk5ODc1NXww&ixlib=rb-4.1.0&q=85",
+      "category": "B-Roll Preview / Action",
+      "description": "man in midair skateboarding (Good for aggressive TikTok style demo)"
+    },
+    {
+      "url": "https://images.unsplash.com/photo-1672872476232-da16b45c9001?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA0MTJ8MHwxfHNlYXJjaHw0fHxuZW9uJTIwY3liZXJwdW5rJTIwY2l0eSUyMHNreWxpbmV8ZW58MHx8fHwxNzgzOTk4NzU1fDA&ixlib=rb-4.1.0&q=85",
+      "category": "B-Roll Preview / Tech",
+      "description": "futuristic city at night with neon lights (Good for B-roll preview)"
+    }
+  ],
+  "instructions_to_main_agent": [
+    "You are building a Gen-Z, unhinged, high-energy SaaS video editor.",
+    "Do NOT make it look like a standard corporate dashboard. Use the provided Anton and Outfit fonts.",
+    "Default to a strict dark mode using #050505 as the base background.",
+    "Use standard HTML/Tailwind for the main layout to allow brutalist, sharp edges. DO NOT use generic rounded cards.",
+    "Shadcn UI can be used for complex components (Dialogs, Select) but MUST be customized to remove rounded corners and soft shadows.",
+    "Implement the transcription area as a scrollable timeline with 'karaoke' active word highlighting.",
+    "Include a 'Style Picker' that drastically changes the caption preview visualization (TikTok vs YouTube).",
+    "Never use generic placeholders. Use the provided Pexels-style image URLs for B-roll previews.",
+    "Build a custom settings modal for Groq/Cerebras/Pexels API keys.",
+    "DO NOT use transparent backgrounds for dropdowns or modals over content."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "Do not converge toward generic outputs. Avoid 'AI slop' aesthetics.",
+    "Do not use dark colors as gradients. Use solid blocks of high-contrast colors.",
+    "Do not use `transition: all`.",
+    "Do not center-align app containers.",
+    "Use modern, sharp, brutalist interactions. NEVER use pill-shaped unless explicitly a toggle.",
+    "Never use AI assistant Emoji characters for icons. Use real SVG icons.",
+    "Every interaction needs micro-animations.",
+    "Use 2-3x more spacing than feels comfortable.",
+    "Prioritize using pre-existing components from src/components/ui when applicable.",
+    "Use 'sonner' for toasts.",
+    "All interactive elements MUST have data-testid attributes."
+  ]
+}
