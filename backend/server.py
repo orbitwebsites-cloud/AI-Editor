@@ -25,6 +25,7 @@ from typing import List, Optional, Dict, Any
 from pathlib import Path
 import os
 import re
+import json
 import logging
 import uuid
 import shutil
@@ -253,6 +254,134 @@ async def list_projects():
         {"_id": 0, "transcript.words": 0, "transcript.segments": 0},
     ).sort("created_at", -1).to_list(100)
     return items
+
+
+# ---------- CHUNKED UPLOAD (for large files bypassing ingress 413) ----------
+UPLOAD_TMP = DATA_DIR / "uploads_tmp"
+UPLOAD_TMP.mkdir(parents=True, exist_ok=True)
+
+
+class UploadInit(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    filename: str
+    size: int
+    total_chunks: int
+
+
+@api.post("/uploads/init")
+async def upload_init(body: UploadInit):
+    ext = os.path.splitext(body.filename or "video.mp4")[1].lower() or ".mp4"
+    if ext not in {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".mpeg", ".mpg", ".qt"}:
+        raise HTTPException(400, f"Unsupported video type: {ext}")
+    if body.size <= 0 or body.total_chunks <= 0:
+        raise HTTPException(400, "Invalid size/chunks")
+    upload_id = uuid.uuid4().hex
+    session_dir = UPLOAD_TMP / upload_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "upload_id": upload_id,
+        "filename": body.filename,
+        "size": body.size,
+        "total_chunks": body.total_chunks,
+        "ext": ext,
+        "received_chunks": [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    async with aiofiles.open(session_dir / "manifest.json", "w") as f:
+        await f.write(json.dumps(manifest))
+    return {"upload_id": upload_id}
+
+
+@api.post("/uploads/chunk/{upload_id}")
+async def upload_chunk(upload_id: str, index: int, file: UploadFile = File(...)):
+    session_dir = UPLOAD_TMP / upload_id
+    manifest_path = session_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(404, "Upload session not found")
+    chunk_path = session_dir / f"chunk_{index:06d}"
+    async with aiofiles.open(chunk_path, "wb") as out:
+        while True:
+            data = await file.read(1024 * 512)
+            if not data:
+                break
+            await out.write(data)
+    # Update manifest
+    async with aiofiles.open(manifest_path, "r") as f:
+        m = json.loads(await f.read())
+    if index not in m["received_chunks"]:
+        m["received_chunks"].append(index)
+    async with aiofiles.open(manifest_path, "w") as f:
+        await f.write(json.dumps(m))
+    return {"ok": True, "received": len(m["received_chunks"]), "total": m["total_chunks"]}
+
+
+@api.post("/uploads/finalize/{upload_id}")
+async def upload_finalize(upload_id: str):
+    session_dir = UPLOAD_TMP / upload_id
+    manifest_path = session_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(404, "Upload session not found")
+    async with aiofiles.open(manifest_path, "r") as f:
+        m = json.loads(await f.read())
+    if len(m["received_chunks"]) != m["total_chunks"]:
+        raise HTTPException(400,
+            f"Missing chunks: got {len(m['received_chunks'])}/{m['total_chunks']}")
+
+    pid = str(uuid.uuid4())
+    ext = m["ext"]
+    dst = DATA_DIR / "videos" / f"{pid}{ext}"
+
+    # Concatenate chunks in order
+    total = 0
+    async with aiofiles.open(dst, "wb") as out:
+        for i in range(m["total_chunks"]):
+            chunk_path = session_dir / f"chunk_{i:06d}"
+            if not chunk_path.exists():
+                dst.unlink(missing_ok=True)
+                raise HTTPException(400, f"Chunk {i} missing on disk")
+            async with aiofiles.open(chunk_path, "rb") as inp:
+                while True:
+                    data = await inp.read(1024 * 1024)
+                    if not data:
+                        break
+                    await out.write(data)
+                    total += len(data)
+
+    # Clean up session dir
+    try:
+        shutil.rmtree(session_dir)
+    except Exception:
+        pass
+
+    try:
+        meta = vp.probe_video(str(dst))
+    except Exception as e:
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, f"Could not read assembled video ({ext}): {str(e)[:200]}")
+
+    project = {
+        "id": pid,
+        "user_id": USER_ID,
+        "name": m.get("filename") or f"Project-{pid[:8]}",
+        "status": "uploaded",
+        "status_message": "Uploaded, ready to analyze",
+        "progress": 0,
+        "original_path": str(dst),
+        "size_bytes": total,
+        "duration": meta.get("duration", 0),
+        "width": meta.get("width", 0),
+        "height": meta.get("height", 0),
+        "fps": meta.get("fps", 30),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "transcript": None,
+        "analysis": None,
+        "output_path": None,
+        "render_options": None,
+    }
+    await db.projects.insert_one(project)
+    project.pop("_id", None)
+    return project
 
 
 @api.get("/projects/{pid}")
